@@ -287,6 +287,9 @@ func (s *Service) Snapshot(id, message string) (*SnapshotResult, error) {
 	if state.Worktree == nil {
 		return nil, fmt.Errorf("agent %q has no active worktree", id)
 	}
+	if err := s.validateSnapshotState(state); err != nil {
+		return nil, err
+	}
 
 	statusOutput, err := s.git(state.Worktree.Path, nil, "", "status", "--porcelain=v1", "--untracked-files=normal")
 	if err != nil {
@@ -413,6 +416,12 @@ func (s *Service) Done(id string, opts DoneOptions) (*ActionResult, error) {
 	}
 	if state.Worktree == nil {
 		return nil, fmt.Errorf("agent %q has no active worktree", id)
+	}
+	if strings.TrimSpace(state.Base) == "" {
+		return nil, fmt.Errorf("agent %q is missing a base commit", id)
+	}
+	if err := s.validateSnapshotState(state); err != nil {
+		return nil, err
 	}
 
 	statusOutput, err := s.git(state.Worktree.Path, nil, "", "status", "--porcelain=v1", "--untracked-files=normal")
@@ -1076,6 +1085,9 @@ func (s *Service) snapshotCount(state *agentState) (int, error) {
 	if state.Base == "" || state.Latest == "" {
 		return 0, nil
 	}
+	if err := s.validateSnapshotState(state); err != nil {
+		return 0, err
+	}
 	out, err := s.git("", nil, "", "rev-list", "--count", "--first-parent", state.Latest, "^"+state.Base)
 	if err != nil {
 		return 0, err
@@ -1146,6 +1158,9 @@ func (s *Service) snapshots(state *agentState) ([]SnapshotInfo, error) {
 	if state.Base == "" || state.Latest == "" {
 		return nil, nil
 	}
+	if err := s.validateSnapshotState(state); err != nil {
+		return nil, err
+	}
 	out, err := s.git("", nil, "", "rev-list", "--first-parent", state.Latest, "^"+state.Base)
 	if err != nil {
 		return nil, err
@@ -1176,6 +1191,8 @@ func (s *Service) currentChanges(state *agentState) ([]FileChange, error) {
 	baseline := state.Latest
 	if baseline == "" {
 		baseline = state.Base
+	} else if err := s.validateSnapshotState(state); err != nil {
+		return nil, err
 	}
 	if baseline == "" {
 		out, err := s.git(state.Worktree.Path, nil, "", "status", "--porcelain=v1", "--untracked-files=normal")
@@ -1262,6 +1279,13 @@ func (s *Service) CommitFileContent(commit, path string) (string, error) {
 func (s *Service) resolveSnapshotSpec(id, spec string) (string, error) {
 	spec = strings.TrimSpace(spec)
 	if spec == "" || spec == "latest" {
+		state, err := s.loadState(id)
+		if err != nil {
+			return "", err
+		}
+		if err := s.validateSnapshotState(state); err != nil {
+			return "", err
+		}
 		ref, ok, err := s.readRef(s.latestRef(id))
 		if err != nil {
 			return "", err
@@ -1282,6 +1306,13 @@ func (s *Service) resolveSnapshotSpec(id, spec string) (string, error) {
 		return ref, nil
 	}
 	if strings.HasPrefix(spec, "~") {
+		state, err := s.loadState(id)
+		if err != nil {
+			return "", err
+		}
+		if err := s.validateSnapshotState(state); err != nil {
+			return "", err
+		}
 		refName := s.latestRef(id) + spec
 		return s.git("", nil, "", "rev-parse", refName)
 	}
@@ -1316,6 +1347,19 @@ func (s *Service) resolveSnapshotSpec(id, spec string) (string, error) {
 		return s.git("", nil, "", "rev-parse", refName)
 	}
 	return s.git("", nil, "", "rev-parse", spec+"^{commit}")
+}
+
+func (s *Service) validateSnapshotState(state *agentState) error {
+	if state == nil || strings.TrimSpace(state.Latest) == "" {
+		return nil
+	}
+	if strings.TrimSpace(state.Base) == "" {
+		return fmt.Errorf("agent %q is missing a base commit", state.ID)
+	}
+	if _, err := s.git("", nil, "", "merge-base", "--is-ancestor", state.Base, state.Latest); err != nil {
+		return fmt.Errorf("agent %q has an invalid snapshot chain: latest is not descended from base", state.ID)
+	}
+	return nil
 }
 
 func (s *Service) resolveDiffSide(id, spec string) (string, bool, error) {

@@ -241,6 +241,136 @@ func TestServiceCreateFailsWhenPreservedBranchExists(t *testing.T) {
 	}
 }
 
+func TestServiceDoneFailsWithoutBaseRef(t *testing.T) {
+	repo := initTestRepo(t)
+	svc, err := NewService(repo)
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+
+	summary, err := svc.Create(CreateOptions{ID: "fix-auth"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	writeFile(t, filepath.Join(summary.Path, "app.txt"), "hello v2\n")
+	runGit(t, repo, "update-ref", "-d", "refs/agents/fix-auth/base")
+
+	_, err = svc.Done("fix-auth", DoneOptions{Message: "done"})
+	if err == nil {
+		t.Fatalf("expected done to fail without base ref")
+	}
+	if !strings.Contains(err.Error(), "missing a base commit") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestServiceDoneCapturesUnsnapshottedRenameAndDelete(t *testing.T) {
+	repo := initTestRepo(t)
+	writeFile(t, filepath.Join(repo, "extra.txt"), "remove me\n")
+	runGit(t, repo, "add", "extra.txt")
+	runGit(t, repo, "commit", "-m", "add extra file")
+
+	svc, err := NewService(repo)
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+
+	summary, err := svc.Create(CreateOptions{ID: "fix-auth"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	oldPath := filepath.Join(summary.Path, "app.txt")
+	newPath := filepath.Join(summary.Path, "renamed.txt")
+	if err := os.Rename(oldPath, newPath); err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+	writeFile(t, newPath, "hello renamed\n")
+	if err := os.Remove(filepath.Join(summary.Path, "extra.txt")); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+
+	result, err := svc.Done("fix-auth", DoneOptions{Message: "agent(fix-auth): finalize"})
+	if err != nil {
+		t.Fatalf("Done: %v", err)
+	}
+	if strings.TrimSpace(result.Commit) == "" {
+		t.Fatalf("expected final commit")
+	}
+
+	files := runGit(t, repo, "ls-tree", "--name-only", "-r", result.Commit)
+	if strings.Contains(files, "app.txt") {
+		t.Fatalf("expected app.txt to be removed, got files:\n%s", files)
+	}
+	if !strings.Contains(files, "renamed.txt") {
+		t.Fatalf("expected renamed.txt in final tree, got files:\n%s", files)
+	}
+	if strings.Contains(files, "extra.txt") {
+		t.Fatalf("expected extra.txt to be deleted, got files:\n%s", files)
+	}
+
+	content := runGitRaw(t, repo, "show", result.Commit+":renamed.txt")
+	if content != "hello renamed\n" {
+		t.Fatalf("unexpected renamed.txt content: %q", content)
+	}
+}
+
+func TestServiceRollbackThenResnapshotRemainsLinear(t *testing.T) {
+	repo := initTestRepo(t)
+	svc, err := NewService(repo)
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+
+	summary, err := svc.Create(CreateOptions{ID: "fix-auth"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	writeFile(t, filepath.Join(summary.Path, "app.txt"), "hello v2\n")
+	snapOne, err := svc.Snapshot("fix-auth", "snapshot one")
+	if err != nil {
+		t.Fatalf("Snapshot one: %v", err)
+	}
+
+	writeFile(t, filepath.Join(summary.Path, "app.txt"), "hello v3\n")
+	snapTwo, err := svc.Snapshot("fix-auth", "snapshot two")
+	if err != nil {
+		t.Fatalf("Snapshot two: %v", err)
+	}
+
+	if _, err := svc.Rollback("fix-auth", "snap-1", "test rollback"); err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+
+	writeFile(t, filepath.Join(summary.Path, "app.txt"), "hello v4\n")
+	snapThree, err := svc.Snapshot("fix-auth", "snapshot three")
+	if err != nil {
+		t.Fatalf("Snapshot three: %v", err)
+	}
+
+	status, err := svc.Status("fix-auth")
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if len(status.Snapshots) != 2 {
+		t.Fatalf("expected 2 snapshots after rollback and resnapshot, got %d", len(status.Snapshots))
+	}
+	if status.Latest != snapThree.Commit {
+		t.Fatalf("expected latest to point at new snapshot, got %s want %s", status.Latest, snapThree.Commit)
+	}
+	if status.Snapshots[0].Parent != snapOne.Commit {
+		t.Fatalf("expected newest snapshot parent %s, got %s", snapOne.Commit, status.Snapshots[0].Parent)
+	}
+	if status.Snapshots[1].Commit != snapOne.Commit {
+		t.Fatalf("expected older snapshot to remain snap one, got %s", status.Snapshots[1].Commit)
+	}
+	if status.Snapshots[0].Commit == snapTwo.Commit {
+		t.Fatalf("expected rolled back snapshot two to be dropped from first-parent history")
+	}
+}
+
 func TestServiceLoadsConfigAndAppliesDefaults(t *testing.T) {
 	repo := initTestRepo(t)
 	runGit(t, repo, "config", "agentgit.defaultOwner", "agent-bot")
