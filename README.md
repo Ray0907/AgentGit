@@ -236,4 +236,4 @@ Out of scope:
 
 ## Status
 
-The project builds and tests with Go, including integration tests that exercise `create`, `snapshot`, `rollback`, `diff`, and `done`.
+The project builds and tests with Go. Automated tests currently cover the core agent workflow: `create`, `snapshot`, `rollback`, `diff`, `done`, `stop`, `resume`, `agent preflight`, `config init`, and `config validate`.
