@@ -17,6 +17,17 @@ const (
 	defaultStopReason            = "manual stop"
 )
 
+const (
+	configKeyCleanHours              = "agentgit.cleanHours"
+	configKeyDashboardRefreshSeconds = "agentgit.dashboardRefreshSeconds"
+	configKeyDefaultOwner            = "agentgit.defaultOwner"
+	configKeyDoneAuthorName          = "agentgit.doneAuthorName"
+	configKeyDoneAuthorEmail         = "agentgit.doneAuthorEmail"
+	configKeyDoneMessageTemplate     = "agentgit.doneMessageTemplate"
+	configKeySnapshotMessageTemplate = "agentgit.snapshotMessageTemplate"
+	configKeyStopReason              = "agentgit.stopReason"
+)
+
 type Config struct {
 	CleanThresholdHours   float64 `json:"clean_threshold_hours"`
 	DashboardRefreshSecs  int     `json:"dashboard_refresh_seconds"`
@@ -28,6 +39,12 @@ type Config struct {
 	DefaultStopReason     string  `json:"default_stop_reason"`
 }
 
+type ConfigInitChange struct {
+	Key    string `json:"key"`
+	Value  string `json:"value"`
+	Action string `json:"action"`
+}
+
 func DefaultConfig() Config {
 	return Config{
 		CleanThresholdHours:   defaultCleanThresholdHours,
@@ -36,6 +53,61 @@ func DefaultConfig() Config {
 		SnapshotMessageFormat: defaultSnapshotMessageFormat,
 		DefaultStopReason:     defaultStopReason,
 	}
+}
+
+func (s *Service) InitConfig() ([]ConfigInitChange, error) {
+	raw, err := gitConfigMap(s.Repo)
+	if err != nil {
+		return nil, err
+	}
+
+	changes := make([]ConfigInitChange, 0, 8)
+	recommended := []ConfigInitChange{
+		{Key: configKeyCleanHours, Value: strconv.FormatFloat(defaultCleanThresholdHours, 'f', -1, 64)},
+		{Key: configKeyDashboardRefreshSeconds, Value: strconv.Itoa(defaultDashboardRefreshSecs)},
+		{Key: configKeyDoneMessageTemplate, Value: defaultDoneMessageTemplate},
+		{Key: configKeySnapshotMessageTemplate, Value: defaultSnapshotMessageFormat},
+		{Key: configKeyStopReason, Value: defaultStopReason},
+	}
+
+	if value, err := gitConfigValue(s.Repo, "user.name"); err != nil {
+		return nil, err
+	} else if value != "" {
+		recommended = append(recommended, ConfigInitChange{Key: configKeyDoneAuthorName, Value: value})
+	}
+	if value, err := gitConfigValue(s.Repo, "user.email"); err != nil {
+		return nil, err
+	} else if value != "" {
+		recommended = append(recommended, ConfigInitChange{Key: configKeyDoneAuthorEmail, Value: value})
+	}
+
+	for _, entry := range recommended {
+		if _, ok := raw[strings.ToLower(entry.Key)]; ok {
+			entry.Action = "skipped"
+			changes = append(changes, entry)
+			continue
+		}
+		if _, err := s.git("", nil, "", "config", "--local", entry.Key, entry.Value); err != nil {
+			return nil, err
+		}
+		entry.Action = "written"
+		changes = append(changes, entry)
+	}
+	return changes, nil
+}
+
+func (s *Service) ValidateConfig() error {
+	raw, err := gitConfigMap(s.Repo)
+	if err != nil {
+		return err
+	}
+	for _, key := range []string{configKeyDoneMessageTemplate, configKeySnapshotMessageTemplate} {
+		if value, ok := raw[strings.ToLower(key)]; ok && strings.TrimSpace(value) == "" {
+			return fmt.Errorf("%s cannot be empty", key)
+		}
+	}
+	_, err = loadConfig(s.Repo)
+	return err
 }
 
 func loadConfig(repo string) (Config, error) {
@@ -97,7 +169,8 @@ func gitConfigMap(repo string) (map[string]string, error) {
 	}
 
 	result := map[string]string{}
-	for _, line := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
+	for _, rawLine := range strings.Split(strings.TrimRight(stdout.String(), "\n"), "\n") {
+		line := strings.TrimRight(rawLine, "\r")
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
@@ -109,6 +182,26 @@ func gitConfigMap(repo string) (map[string]string, error) {
 		result[key] = strings.TrimSpace(parts[1])
 	}
 	return result, nil
+}
+
+func gitConfigValue(repo, key string) (string, error) {
+	cmd := exec.Command("git", "-C", repo, "config", "--get", key)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		exitErr, ok := err.(*exec.ExitError)
+		if ok && exitErr.ExitCode() == 1 {
+			return "", nil
+		}
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = err.Error()
+		}
+		return "", fmt.Errorf("failed to read git config %s: %s", key, msg)
+	}
+	return strings.TrimSpace(stdout.String()), nil
 }
 
 func firstNonEmpty(values ...string) string {

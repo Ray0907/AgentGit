@@ -499,6 +499,64 @@ func TestServiceLoadsConfigAndAppliesDefaults(t *testing.T) {
 	}
 }
 
+func TestServiceInitConfigWritesMissingRepoPolicy(t *testing.T) {
+	repo := initTestRepo(t)
+	svc, err := NewService(repo)
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+
+	changes, err := svc.InitConfig()
+	if err != nil {
+		t.Fatalf("InitConfig: %v", err)
+	}
+	if len(changes) == 0 {
+		t.Fatalf("expected init config to write recommended keys")
+	}
+
+	foundDoneTemplate := false
+	foundAuthorName := false
+	for _, change := range changes {
+		if change.Key == "agentgit.doneMessageTemplate" && change.Action == "written" {
+			foundDoneTemplate = true
+		}
+		if change.Key == "agentgit.doneAuthorName" && change.Action == "written" {
+			foundAuthorName = true
+		}
+	}
+	if !foundDoneTemplate {
+		t.Fatalf("expected done message template to be written, got %+v", changes)
+	}
+	if !foundAuthorName {
+		t.Fatalf("expected done author name to be seeded from git user.name, got %+v", changes)
+	}
+
+	if got := runGit(t, repo, "config", "--get", "agentgit.doneMessageTemplate"); got != "agent({id}): {purpose}" {
+		t.Fatalf("unexpected done message template: %q", got)
+	}
+	if got := runGit(t, repo, "config", "--get", "agentgit.doneAuthorName"); got != "Test User" {
+		t.Fatalf("unexpected done author name: %q", got)
+	}
+}
+
+func TestServiceValidateConfigRejectsEmptyTemplate(t *testing.T) {
+	repo := initTestRepo(t)
+	runGit(t, repo, "config", "agentgit.doneMessageTemplate", "")
+
+	svc, err := NewService(repo)
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+
+	err = svc.ValidateConfig()
+	if err == nil {
+		t.Fatalf("expected validate config to fail for empty template")
+	}
+	if !strings.Contains(err.Error(), "agentgit.doneMessageTemplate cannot be empty") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestAgentPreflightInfoReflectsStopAndPolicy(t *testing.T) {
 	repo := initTestRepo(t)
 	runGit(t, repo, "config", "agentgit.defaultOwner", "agent-bot")

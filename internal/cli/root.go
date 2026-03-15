@@ -497,6 +497,7 @@ func newAgentCmd(opts *rootOptions) *cobra.Command {
 		newAgentPreflightCmd(opts),
 		newAgentShouldStopCmd(opts),
 		newAgentCheckpointCmd(opts),
+		newAgentFinishCmd(opts),
 	)
 	return cmd
 }
@@ -615,34 +616,113 @@ func newAgentCheckpointCmd(opts *rootOptions) *cobra.Command {
 	return cmd
 }
 
-func newConfigCmd(opts *rootOptions) *cobra.Command {
+func newAgentFinishCmd(opts *rootOptions) *cobra.Command {
+	var msg string
+	var authorName string
+	var authorEmail string
 	cmd := &cobra.Command{
-		Use:   "config",
-		Short: "Config and policy inspection",
-	}
-	cmd.AddCommand(&cobra.Command{
-		Use:   "show",
-		Short: "Show the effective AgentGit config for this repo",
+		Use:   "finish <id>",
+		Short: "Agent-friendly alias for done",
+		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			svc, err := app.NewService(opts.Repo)
 			if err != nil {
 				return err
 			}
-			cfg := svc.EffectiveConfig()
-			if opts.JSON {
-				return printJSON(cfg)
+			result, err := svc.Done(args[0], app.DoneOptions{
+				Message:     msg,
+				AuthorName:  authorName,
+				AuthorEmail: authorEmail,
+			})
+			if err != nil {
+				return err
 			}
-			fmt.Printf("clean_threshold_hours=%.1f\n", cfg.CleanThresholdHours)
-			fmt.Printf("dashboard_refresh_seconds=%d\n", cfg.DashboardRefreshSecs)
-			fmt.Printf("default_owner=%s\n", cfg.DefaultOwner)
-			fmt.Printf("done_author_name=%s\n", cfg.DoneAuthorName)
-			fmt.Printf("done_author_email=%s\n", cfg.DoneAuthorEmail)
-			fmt.Printf("done_message_template=%s\n", cfg.DoneMessageTemplate)
-			fmt.Printf("snapshot_message_template=%s\n", cfg.SnapshotMessageFormat)
-			fmt.Printf("default_stop_reason=%s\n", cfg.DefaultStopReason)
+			if opts.JSON {
+				return printJSON(result)
+			}
+			if result.Commit == "" {
+				fmt.Printf("%s cleaned %s\n", result.ID, result.Branch)
+				return nil
+			}
+			fmt.Printf("%s %s %s\n", result.ID, result.Branch, result.Commit)
 			return nil
 		},
-	})
+	}
+	cmd.Flags().StringVar(&msg, "msg", "", "final commit message")
+	cmd.Flags().StringVar(&authorName, "author-name", "", "final commit author name")
+	cmd.Flags().StringVar(&authorEmail, "author-email", "", "final commit author email")
+	return cmd
+}
+
+func newConfigCmd(opts *rootOptions) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "config",
+		Short: "Config and policy inspection",
+	}
+	cmd.AddCommand(
+		&cobra.Command{
+			Use:   "show",
+			Short: "Show the effective AgentGit config for this repo",
+			RunE: func(cmd *cobra.Command, args []string) error {
+				svc, err := app.NewService(opts.Repo)
+				if err != nil {
+					return err
+				}
+				cfg := svc.EffectiveConfig()
+				if opts.JSON {
+					return printJSON(cfg)
+				}
+				fmt.Printf("clean_threshold_hours=%.1f\n", cfg.CleanThresholdHours)
+				fmt.Printf("dashboard_refresh_seconds=%d\n", cfg.DashboardRefreshSecs)
+				fmt.Printf("default_owner=%s\n", cfg.DefaultOwner)
+				fmt.Printf("done_author_name=%s\n", cfg.DoneAuthorName)
+				fmt.Printf("done_author_email=%s\n", cfg.DoneAuthorEmail)
+				fmt.Printf("done_message_template=%s\n", cfg.DoneMessageTemplate)
+				fmt.Printf("snapshot_message_template=%s\n", cfg.SnapshotMessageFormat)
+				fmt.Printf("default_stop_reason=%s\n", cfg.DefaultStopReason)
+				return nil
+			},
+		},
+		&cobra.Command{
+			Use:   "init",
+			Short: "Write recommended repo-local AgentGit config without overwriting existing keys",
+			RunE: func(cmd *cobra.Command, args []string) error {
+				svc, err := app.NewService(opts.Repo)
+				if err != nil {
+					return err
+				}
+				changes, err := svc.InitConfig()
+				if err != nil {
+					return err
+				}
+				if opts.JSON {
+					return printJSON(changes)
+				}
+				for _, change := range changes {
+					fmt.Printf("%s %s=%s\n", change.Action, change.Key, change.Value)
+				}
+				return nil
+			},
+		},
+		&cobra.Command{
+			Use:   "validate",
+			Short: "Validate known AgentGit config keys for this repo",
+			RunE: func(cmd *cobra.Command, args []string) error {
+				svc, err := app.NewService(opts.Repo)
+				if err != nil {
+					return err
+				}
+				if err := svc.ValidateConfig(); err != nil {
+					return err
+				}
+				if opts.JSON {
+					return printJSON(map[string]string{"status": "ok"})
+				}
+				fmt.Println("config valid")
+				return nil
+			},
+		},
+	)
 	return cmd
 }
 
