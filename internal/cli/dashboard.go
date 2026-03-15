@@ -74,7 +74,7 @@ func runDashboard(svc *app.Service) error {
 		entries:    entries,
 		width:      120,
 		height:     36,
-		statusLine: "[j/k] move  [enter] detail  [r] refresh  [q] quit",
+		statusLine: "[↑/↓] move  [→/enter] detail  [r] refresh  [q] quit",
 	}
 	if len(entries) > 0 {
 		_ = model.loadPreview(entries[0].ID)
@@ -150,13 +150,20 @@ func (m dashModel) updateList(key string) (tea.Model, tea.Cmd) {
 		if err := m.loadDetail(m.entries[m.selected].ID); err != nil {
 			m.err = err
 		}
+	case "right":
+		if len(m.entries) == 0 {
+			return m, nil
+		}
+		if err := m.loadDetail(m.entries[m.selected].ID); err != nil {
+			m.err = err
+		}
 	}
 	return m, nil
 }
 
 func (m dashModel) updateDetail(key string) (tea.Model, tea.Cmd) {
 	switch key {
-	case "tab":
+	case "tab", "left", "right":
 		if m.focus == focusSnapshots {
 			m.focus = focusFiles
 		} else {
@@ -223,14 +230,14 @@ func (m dashModel) refresh() (dashModel, tea.Cmd) {
 		if err := m.loadSelectedPreview(); err != nil {
 			m.err = err
 		}
-		m.statusLine = "[j/k] move  [enter] detail  [r] refresh  [q] quit"
+		m.statusLine = "[↑/↓] move  [→/enter] detail  [r] refresh  [q] quit"
 	case modeDetail:
 		if m.detail != nil {
 			if err := m.loadDetail(m.detail.Summary.ID); err != nil {
 				m.err = err
 				m.mode = modeList
 				m.detail = nil
-				m.statusLine = "[j/k] move  [enter] detail  [r] refresh  [q] quit"
+				m.statusLine = "[↑/↓] move  [→/enter] detail  [r] refresh  [q] quit"
 			}
 		}
 	}
@@ -244,7 +251,7 @@ func (m dashModel) goBack() (tea.Model, tea.Cmd) {
 		m.fileBody = ""
 		m.fileTitle = ""
 		if m.detail != nil {
-			m.statusLine = fmt.Sprintf("detail: %s  [tab] switch pane  [d] diff  [f] file  [esc] back", m.detail.Summary.ID)
+			m.statusLine = fmt.Sprintf("detail: %s  [←/→] switch pane  [d] diff  [f] file  [esc] back", m.detail.Summary.ID)
 		}
 	case modeDetail:
 		m.mode = modeList
@@ -252,7 +259,7 @@ func (m dashModel) goBack() (tea.Model, tea.Cmd) {
 		m.snapshotIndex = 0
 		m.fileIndex = 0
 		m.focus = focusSnapshots
-		m.statusLine = "[j/k] move  [enter] detail  [r] refresh  [q] quit"
+		m.statusLine = "[↑/↓] move  [→/enter] detail  [r] refresh  [q] quit"
 	}
 	return m, nil
 }
@@ -288,7 +295,7 @@ func (m *dashModel) loadDetail(id string) error {
 	if m.fileIndex >= len(m.currentChanges()) {
 		m.fileIndex = 0
 	}
-	m.statusLine = fmt.Sprintf("detail: %s  [tab] switch pane  [d] diff  [f] file  [esc] back", id)
+	m.statusLine = fmt.Sprintf("detail: %s  [←/→] switch pane  [d] diff  [f] file  [esc] back", id)
 	return nil
 }
 
