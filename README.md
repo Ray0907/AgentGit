@@ -6,6 +6,12 @@ It gives each agent its own worktree, stores agent state in git refs, supports l
 
 The CLI binary is `agt`.
 
+## Stability
+
+AgentGit is experimental and is not production-ready yet.
+
+Use it in local or test repositories first. Do not make it the primary workflow for production repositories until it has been validated in your environment.
+
 ## Features
 
 - isolated agent worktrees via `git worktree`
