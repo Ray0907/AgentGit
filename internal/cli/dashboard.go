@@ -22,10 +22,20 @@ const (
 )
 
 type dashFocus string
+type dashAction string
 
 const (
 	focusSnapshots dashFocus = "snapshots"
 	focusFiles     dashFocus = "files"
+)
+
+const (
+	actionNone     dashAction = ""
+	actionStop     dashAction = "stop"
+	actionResume   dashAction = "resume"
+	actionRollback dashAction = "rollback"
+	actionAbort    dashAction = "abort"
+	actionDone     dashAction = "done"
 )
 
 var (
@@ -57,6 +67,8 @@ type dashModel struct {
 	fileBody      string
 	fileTitle     string
 	statusLine    string
+	confirmAction dashAction
+	confirmPrompt string
 	width         int
 	height        int
 	err           error
@@ -74,7 +86,7 @@ func runDashboard(svc *app.Service) error {
 		entries:    entries,
 		width:      120,
 		height:     36,
-		statusLine: "[↑/↓] move  [→/enter] detail  [r] refresh  [q] quit",
+		statusLine: listStatusLine(),
 	}
 	if len(entries) > 0 {
 		_ = model.loadPreview(entries[0].ID)
@@ -97,8 +109,6 @@ func (m dashModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
-		case "r":
-			return m.refresh()
 		case "esc", "backspace":
 			return m.goBack()
 		}
@@ -133,6 +143,8 @@ func (m dashModel) View() string {
 
 func (m dashModel) updateList(key string) (tea.Model, tea.Cmd) {
 	switch key {
+	case "r":
+		return m.refresh()
 	case "j", "down":
 		if m.selected < len(m.entries)-1 {
 			m.selected++
@@ -162,6 +174,9 @@ func (m dashModel) updateList(key string) (tea.Model, tea.Cmd) {
 }
 
 func (m dashModel) updateDetail(key string) (tea.Model, tea.Cmd) {
+	if m.confirmAction != actionNone {
+		return m.updateConfirm(key)
+	}
 	switch key {
 	case "tab", "left", "right":
 		if m.focus == focusSnapshots {
@@ -187,6 +202,26 @@ func (m dashModel) updateDetail(key string) (tea.Model, tea.Cmd) {
 		} else if m.fileIndex > 0 {
 			m.fileIndex--
 		}
+	case "s":
+		if err := m.beginConfirm(actionStop); err != nil {
+			m.err = err
+		}
+	case "u":
+		if err := m.beginConfirm(actionResume); err != nil {
+			m.err = err
+		}
+	case "r":
+		if err := m.beginConfirm(actionRollback); err != nil {
+			m.err = err
+		}
+	case "x":
+		if err := m.beginConfirm(actionAbort); err != nil {
+			m.err = err
+		}
+	case "D":
+		if err := m.beginConfirm(actionDone); err != nil {
+			m.err = err
+		}
 	case "d":
 		if err := m.openFileView(modeDiff); err != nil {
 			m.err = err
@@ -195,6 +230,18 @@ func (m dashModel) updateDetail(key string) (tea.Model, tea.Cmd) {
 		if err := m.openFileView(modeContent); err != nil {
 			m.err = err
 		}
+	}
+	return m, nil
+}
+
+func (m dashModel) updateConfirm(key string) (tea.Model, tea.Cmd) {
+	switch key {
+	case "y", "enter":
+		if err := m.executeConfirm(); err != nil {
+			m.err = err
+		}
+	case "n":
+		m.clearConfirm()
 	}
 	return m, nil
 }
@@ -214,15 +261,8 @@ func (m dashModel) updateFileView(key string) (tea.Model, tea.Cmd) {
 }
 
 func (m dashModel) refresh() (dashModel, tea.Cmd) {
-	entries, err := m.svc.ListAgents()
-	m.entries = entries
-	m.err = err
-	if m.selected >= len(m.entries) && len(m.entries) > 0 {
-		m.selected = len(m.entries) - 1
-	}
-	if len(m.entries) == 0 {
-		m.selected = 0
-		m.preview = nil
+	if err := m.reloadEntries(m.selectedID()); err != nil {
+		m.err = err
 	}
 
 	switch m.mode {
@@ -230,14 +270,14 @@ func (m dashModel) refresh() (dashModel, tea.Cmd) {
 		if err := m.loadSelectedPreview(); err != nil {
 			m.err = err
 		}
-		m.statusLine = "[↑/↓] move  [→/enter] detail  [r] refresh  [q] quit"
+		m.statusLine = listStatusLine()
 	case modeDetail:
 		if m.detail != nil {
 			if err := m.loadDetail(m.detail.Summary.ID); err != nil {
 				m.err = err
 				m.mode = modeList
 				m.detail = nil
-				m.statusLine = "[↑/↓] move  [→/enter] detail  [r] refresh  [q] quit"
+				m.statusLine = listStatusLine()
 			}
 		}
 	}
@@ -250,16 +290,18 @@ func (m dashModel) goBack() (tea.Model, tea.Cmd) {
 		m.mode = modeDetail
 		m.fileBody = ""
 		m.fileTitle = ""
-		if m.detail != nil {
-			m.statusLine = fmt.Sprintf("detail: %s  [←/→] switch pane  [d] diff  [f] file  [esc] back", m.detail.Summary.ID)
-		}
+		m.setDetailStatusLine()
 	case modeDetail:
+		if m.confirmAction != actionNone {
+			m.clearConfirm()
+			return m, nil
+		}
 		m.mode = modeList
 		m.detail = nil
 		m.snapshotIndex = 0
 		m.fileIndex = 0
 		m.focus = focusSnapshots
-		m.statusLine = "[↑/↓] move  [→/enter] detail  [r] refresh  [q] quit"
+		m.statusLine = listStatusLine()
 	}
 	return m, nil
 }
@@ -295,7 +337,8 @@ func (m *dashModel) loadDetail(id string) error {
 	if m.fileIndex >= len(m.currentChanges()) {
 		m.fileIndex = 0
 	}
-	m.statusLine = fmt.Sprintf("detail: %s  [←/→] switch pane  [d] diff  [f] file  [esc] back", id)
+	m.clearConfirm()
+	m.setDetailStatusLine()
 	return nil
 }
 
@@ -336,6 +379,164 @@ func (m *dashModel) openFileView(mode dashMode) error {
 	m.fileTitle = fmt.Sprintf("%s  %s  %s", snapshot.Name, change.Status, change.Path)
 	m.statusLine = "[d] diff  [f] file  [esc] back  [q] quit"
 	return nil
+}
+
+func (m *dashModel) beginConfirm(action dashAction) error {
+	if m.detail == nil {
+		return fmt.Errorf("no detail loaded")
+	}
+
+	switch action {
+	case actionStop:
+		if m.detail.Summary.Status != "active" {
+			return fmt.Errorf("stop is only available for active agents")
+		}
+		m.confirmPrompt = fmt.Sprintf("stop %s? [y/N]", m.detail.Summary.ID)
+	case actionResume:
+		if m.detail.Summary.Status != "stopped" {
+			return fmt.Errorf("resume is only available for stopped agents")
+		}
+		m.confirmPrompt = fmt.Sprintf("resume %s? [y/N]", m.detail.Summary.ID)
+	case actionRollback:
+		snapshot := m.currentSnapshot()
+		if snapshot == nil {
+			return fmt.Errorf("select a snapshot to roll back to")
+		}
+		m.confirmPrompt = fmt.Sprintf("rollback %s to %s? [y/N]", m.detail.Summary.ID, snapshot.Name)
+	case actionAbort:
+		m.confirmPrompt = fmt.Sprintf("abort %s and delete branch/worktree? [y/N]", m.detail.Summary.ID)
+	case actionDone:
+		m.confirmPrompt = fmt.Sprintf("finalize %s and remove worktree? [y/N]", m.detail.Summary.ID)
+	default:
+		return fmt.Errorf("unknown action %q", action)
+	}
+
+	m.confirmAction = action
+	m.statusLine = dashWarn.Render(m.confirmPrompt)
+	return nil
+}
+
+func (m *dashModel) executeConfirm() error {
+	if m.detail == nil {
+		return fmt.Errorf("no detail loaded")
+	}
+
+	id := m.detail.Summary.ID
+	selectedID := m.selectedID()
+	if selectedID == "" {
+		selectedID = id
+	}
+
+	switch m.confirmAction {
+	case actionStop:
+		if _, err := m.svc.Stop(id, ""); err != nil {
+			return err
+		}
+		if err := m.loadDetail(id); err != nil {
+			return err
+		}
+	case actionResume:
+		if _, err := m.svc.Resume(id); err != nil {
+			return err
+		}
+		if err := m.loadDetail(id); err != nil {
+			return err
+		}
+	case actionRollback:
+		snapshot := m.currentSnapshot()
+		if snapshot == nil {
+			return fmt.Errorf("select a snapshot to roll back to")
+		}
+		if _, err := m.svc.Rollback(id, snapshot.Name, "dashboard rollback"); err != nil {
+			return err
+		}
+		if err := m.loadDetail(id); err != nil {
+			return err
+		}
+	case actionAbort:
+		if _, err := m.svc.Abort(id); err != nil {
+			return err
+		}
+		m.mode = modeList
+		m.detail = nil
+		if err := m.reloadEntries(selectedID); err != nil {
+			return err
+		}
+		if err := m.loadSelectedPreview(); err != nil {
+			m.preview = nil
+		}
+	case actionDone:
+		if _, err := m.svc.Done(id, app.DoneOptions{}); err != nil {
+			return err
+		}
+		m.mode = modeList
+		m.detail = nil
+		if err := m.reloadEntries(selectedID); err != nil {
+			return err
+		}
+		if err := m.loadSelectedPreview(); err != nil {
+			m.preview = nil
+		}
+	default:
+		return fmt.Errorf("unknown action %q", m.confirmAction)
+	}
+
+	m.clearConfirm()
+	return nil
+}
+
+func (m *dashModel) clearConfirm() {
+	m.confirmAction = actionNone
+	m.confirmPrompt = ""
+	m.setDetailStatusLine()
+}
+
+func (m *dashModel) setDetailStatusLine() {
+	if m.detail == nil {
+		m.statusLine = listStatusLine()
+		return
+	}
+	if m.confirmAction != actionNone {
+		m.statusLine = dashWarn.Render(m.confirmPrompt)
+		return
+	}
+	m.statusLine = fmt.Sprintf("detail: %s  [←/→] pane  [d] diff  [f] file  [s] stop  [u] resume  [r] rollback  [D] done  [x] abort  [esc] back",
+		m.detail.Summary.ID)
+}
+
+func (m *dashModel) reloadEntries(selectedID string) error {
+	entries, err := m.svc.ListAgents()
+	if err != nil {
+		return err
+	}
+	m.entries = entries
+	if len(entries) == 0 {
+		m.selected = 0
+		m.preview = nil
+		return nil
+	}
+	if selectedID != "" {
+		for i, entry := range entries {
+			if entry.ID == selectedID {
+				m.selected = i
+				return nil
+			}
+		}
+	}
+	if m.selected >= len(entries) {
+		m.selected = len(entries) - 1
+	}
+	if m.selected < 0 {
+		m.selected = 0
+	}
+	return nil
+}
+
+func (m dashModel) selectedID() string {
+	if len(m.entries) == 0 || m.selected < 0 || m.selected >= len(m.entries) {
+		return ""
+	}
+	return m.entries[m.selected].ID
 }
 
 func (m dashModel) renderListScreen() string {
@@ -577,6 +778,16 @@ func (m dashModel) renderInspectorPane(width, height int) string {
 		lines = append(lines, "", dashHeader.Render("Stop"))
 		lines = append(lines, m.detail.Stop.Reason)
 	}
+	lines = append(lines, "", dashHeader.Render("Actions"))
+	if m.detail.Summary.Status == "active" {
+		lines = append(lines, "  s  stop")
+	} else if m.detail.Summary.Status == "stopped" {
+		lines = append(lines, "  u  resume")
+	}
+	if m.currentSnapshot() != nil {
+		lines = append(lines, "  r  rollback to selected snapshot")
+	}
+	lines = append(lines, "  D  finalize selected agent", "  x  abort selected agent")
 	return fitLines(lines, width, height)
 }
 
@@ -658,4 +869,8 @@ func coalesce(value, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func listStatusLine() string {
+	return "[↑/↓] move  [→/enter] detail  [r] refresh  [q] quit"
 }
