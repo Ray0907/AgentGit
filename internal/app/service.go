@@ -22,7 +22,8 @@ var insertionsPattern = regexp.MustCompile(`(\d+)\s+insertions?\(\+\)`)
 var deletionsPattern = regexp.MustCompile(`(\d+)\s+deletions?\(-\)`)
 
 type Service struct {
-	Repo string
+	Repo   string
+	Config Config
 }
 
 type CreateOptions struct {
@@ -175,7 +176,13 @@ func NewService(path string) (*Service, error) {
 		return nil, fmt.Errorf("failed to resolve git repo from %s: %s", absPath, msg)
 	}
 
-	return &Service{Repo: strings.TrimSpace(stdout.String())}, nil
+	repo := strings.TrimSpace(stdout.String())
+	cfg, err := loadConfig(repo)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Service{Repo: repo, Config: cfg}, nil
 }
 
 func (s *Service) Create(opts CreateOptions) (_ *AgentSummary, err error) {
@@ -256,7 +263,7 @@ func (s *Service) Create(opts CreateOptions) (_ *AgentSummary, err error) {
 	meta := AgentMeta{
 		ID:        opts.ID,
 		Purpose:   opts.Purpose,
-		Owner:     opts.Owner,
+		Owner:     firstNonEmpty(opts.Owner, s.Config.DefaultOwner),
 		Branch:    branch,
 		Path:      worktreePath,
 		Repo:      s.Repo,
@@ -310,7 +317,7 @@ func (s *Service) Snapshot(id, message string) (*SnapshotResult, error) {
 	}
 
 	if strings.TrimSpace(message) == "" {
-		message = "snapshot: " + time.Now().UTC().Format(time.RFC3339)
+		message = s.renderTemplate(s.Config.SnapshotMessageFormat, id, state.Meta, time.Now().UTC())
 	}
 	commitID, err := s.createCommit(treeID, parent, message, s.authorEnv(state.metaOwnerOrDefault(), ""))
 	if err != nil {
@@ -375,7 +382,7 @@ func (s *Service) Rollback(id, spec, reason string) (*RollbackResult, error) {
 
 func (s *Service) Stop(id, reason string) (*AgentStatus, error) {
 	if strings.TrimSpace(reason) == "" {
-		reason = "manual stop"
+		reason = s.Config.DefaultStopReason
 	}
 
 	state, err := s.loadState(id)
@@ -447,7 +454,7 @@ func (s *Service) Done(id string, opts DoneOptions) (*ActionResult, error) {
 			return nil, err
 		}
 		if finalTree != parentTree {
-			env := s.authorEnv(s.authorName(opts, state.Meta), opts.AuthorEmail)
+			env := s.authorEnv(s.authorName(opts, state.Meta), s.authorEmail(opts))
 			finalCommit, err = s.createCommit(finalTree, branchParent, message, env)
 			if err != nil {
 				return nil, err
@@ -647,6 +654,9 @@ func (s *Service) CleanCandidates(hours float64) ([]CleanCandidate, error) {
 		return nil, err
 	}
 
+	if hours <= 0 {
+		hours = s.Config.CleanThresholdHours
+	}
 	threshold := time.Duration(hours * float64(time.Hour))
 	now := time.Now()
 	candidates := make([]CleanCandidate, 0)
@@ -745,6 +755,71 @@ func (s *Service) ApplyClean(candidates []CleanCandidate) (*CleanResult, error) 
 
 func (s *Service) RepoName() string {
 	return filepath.Base(s.Repo)
+}
+
+func (s *Service) EffectiveConfig() Config {
+	return s.Config
+}
+
+type AgentPreflight struct {
+	ID              string   `json:"id"`
+	Path            string   `json:"path,omitempty"`
+	Branch          string   `json:"branch,omitempty"`
+	Base            string   `json:"base,omitempty"`
+	Latest          string   `json:"latest,omitempty"`
+	Locked          bool     `json:"locked"`
+	ShouldStop      bool     `json:"should_stop"`
+	StopReason      string   `json:"stop_reason,omitempty"`
+	CurrentChanges  int      `json:"current_changes"`
+	CurrentPaths    []string `json:"current_paths,omitempty"`
+	SnapshotCount   int      `json:"snapshot_count"`
+	DoneAuthorName  string   `json:"done_author_name,omitempty"`
+	DoneAuthorEmail string   `json:"done_author_email,omitempty"`
+	DoneMessage     string   `json:"done_message_preview,omitempty"`
+	SnapshotMessage string   `json:"snapshot_message_preview,omitempty"`
+	DefaultOwner    string   `json:"default_owner,omitempty"`
+	RefreshSeconds  int      `json:"refresh_seconds"`
+	CleanHours      float64  `json:"clean_threshold_hours"`
+}
+
+func (s *Service) AgentPreflightInfo(id string) (*AgentPreflight, error) {
+	status, err := s.Status(id)
+	if err != nil {
+		return nil, err
+	}
+
+	currentPaths := make([]string, 0, len(status.CurrentChanges))
+	for _, change := range status.CurrentChanges {
+		currentPaths = append(currentPaths, change.Path)
+	}
+
+	stopReason := ""
+	shouldStop := false
+	if status.Stop != nil {
+		shouldStop = true
+		stopReason = status.Stop.Reason
+	}
+
+	return &AgentPreflight{
+		ID:              id,
+		Path:            status.Summary.Path,
+		Branch:          status.Summary.Branch,
+		Base:            status.Base,
+		Latest:          status.Latest,
+		Locked:          status.Locked,
+		ShouldStop:      shouldStop,
+		StopReason:      stopReason,
+		CurrentChanges:  len(status.CurrentChanges),
+		CurrentPaths:    currentPaths,
+		SnapshotCount:   len(status.Snapshots),
+		DoneAuthorName:  firstNonEmpty(s.Config.DoneAuthorName, status.Summary.Owner),
+		DoneAuthorEmail: s.Config.DoneAuthorEmail,
+		DoneMessage:     s.defaultDoneMessage(id, statusToMeta(status)),
+		SnapshotMessage: s.renderTemplate(s.Config.SnapshotMessageFormat, id, statusToMeta(status), time.Now().UTC()),
+		DefaultOwner:    s.Config.DefaultOwner,
+		RefreshSeconds:  s.Config.DashboardRefreshSecs,
+		CleanHours:      s.Config.CleanThresholdHours,
+	}, nil
 }
 
 func (s *Service) loadState(id string) (*agentState, error) {
@@ -1279,15 +1354,29 @@ func (s *Service) authorName(opts DoneOptions, meta *AgentMeta) string {
 	if strings.TrimSpace(opts.AuthorName) != "" {
 		return opts.AuthorName
 	}
+	if strings.TrimSpace(s.Config.DoneAuthorName) != "" {
+		return s.Config.DoneAuthorName
+	}
 	if meta != nil && strings.TrimSpace(meta.Owner) != "" {
 		return meta.Owner
 	}
 	return "agent"
 }
 
+func (s *Service) authorEmail(opts DoneOptions) string {
+	if strings.TrimSpace(opts.AuthorEmail) != "" {
+		return opts.AuthorEmail
+	}
+	if strings.TrimSpace(s.Config.DoneAuthorEmail) != "" {
+		return s.Config.DoneAuthorEmail
+	}
+	return ""
+}
+
 func (s *Service) defaultDoneMessage(id string, meta *AgentMeta) string {
-	if meta != nil && strings.TrimSpace(meta.Purpose) != "" {
-		return fmt.Sprintf("agent(%s): %s", id, meta.Purpose)
+	message := s.renderTemplate(s.Config.DoneMessageTemplate, id, meta, time.Now().UTC())
+	if strings.TrimSpace(message) != "" {
+		return message
 	}
 	return fmt.Sprintf("agent(%s): finalize work", id)
 }
@@ -1534,4 +1623,42 @@ func normalizePathForContent(path string) string {
 		return strings.TrimSpace(parts[len(parts)-1])
 	}
 	return trimmed
+}
+
+func (s *Service) renderTemplate(template, id string, meta *AgentMeta, ts time.Time) string {
+	if strings.TrimSpace(template) == "" {
+		return ""
+	}
+	purpose := ""
+	owner := ""
+	branch := "agent/" + id
+	if meta != nil {
+		purpose = meta.Purpose
+		owner = meta.Owner
+		if meta.Branch != "" {
+			branch = meta.Branch
+		}
+	}
+	purpose = firstNonEmpty(purpose, "finalize work")
+	rendered := strings.NewReplacer(
+		"{id}", id,
+		"{purpose}", purpose,
+		"{owner}", owner,
+		"{branch}", branch,
+		"{timestamp}", ts.Format(time.RFC3339),
+	).Replace(template)
+	return strings.TrimSpace(rendered)
+}
+
+func statusToMeta(status *AgentStatus) *AgentMeta {
+	if status == nil {
+		return nil
+	}
+	return &AgentMeta{
+		ID:      status.Summary.ID,
+		Purpose: status.Summary.Purpose,
+		Owner:   status.Summary.Owner,
+		Branch:  status.Summary.Branch,
+		Path:    status.Summary.Path,
+	}
 }

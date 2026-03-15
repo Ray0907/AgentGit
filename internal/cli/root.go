@@ -17,6 +17,19 @@ type rootOptions struct {
 	JSON bool
 }
 
+type ExitCodeError struct {
+	Code    int
+	Message string
+}
+
+func (e ExitCodeError) Error() string {
+	return e.Message
+}
+
+func (e ExitCodeError) ExitCode() int {
+	return e.Code
+}
+
 func Execute() error {
 	opts := &rootOptions{}
 	rootCmd := &cobra.Command{
@@ -40,6 +53,8 @@ func Execute() error {
 		newDiffCmd(opts),
 		newStopCmd(opts),
 		newCleanCmd(opts),
+		newAgentCmd(opts),
+		newConfigCmd(opts),
 		newDashCmd(opts),
 	)
 
@@ -442,9 +457,167 @@ func newCleanCmd(opts *rootOptions) *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().Float64Var(&hours, "hours", 24, "stale threshold in hours")
+	cmd.Flags().Float64Var(&hours, "hours", 0, "stale threshold in hours (0 uses repo config)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "show candidates without deleting")
 	cmd.Flags().BoolVar(&force, "force", false, "remove all candidates without prompting")
+	return cmd
+}
+
+func newAgentCmd(opts *rootOptions) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "agent",
+		Short: "Agent integration helpers",
+	}
+	cmd.AddCommand(
+		newAgentPreflightCmd(opts),
+		newAgentShouldStopCmd(opts),
+		newAgentCheckpointCmd(opts),
+	)
+	return cmd
+}
+
+func newAgentPreflightCmd(opts *rootOptions) *cobra.Command {
+	return &cobra.Command{
+		Use:   "preflight <id>",
+		Short: "Return agent-facing status, policy, and stop information",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			svc, err := app.NewService(opts.Repo)
+			if err != nil {
+				return err
+			}
+			info, err := svc.AgentPreflightInfo(args[0])
+			if err != nil {
+				return err
+			}
+			if opts.JSON {
+				return printJSON(info)
+			}
+			fmt.Printf("id=%s should_stop=%t locked=%t snapshots=%d current_changes=%d\n",
+				info.ID, info.ShouldStop, info.Locked, info.SnapshotCount, info.CurrentChanges)
+			if info.StopReason != "" {
+				fmt.Printf("stop_reason=%s\n", info.StopReason)
+			}
+			fmt.Printf("path=%s\nbranch=%s\n", info.Path, info.Branch)
+			return nil
+		},
+	}
+}
+
+func newAgentShouldStopCmd(opts *rootOptions) *cobra.Command {
+	var quiet bool
+	var exitCode bool
+	returnCmd := &cobra.Command{
+		Use:   "should-stop <id>",
+		Short: "Check whether a cooperative stop signal is present",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			svc, err := app.NewService(opts.Repo)
+			if err != nil {
+				return err
+			}
+			info, err := svc.AgentPreflightInfo(args[0])
+			if err != nil {
+				return err
+			}
+			if opts.JSON {
+				return printJSON(map[string]any{
+					"id":          info.ID,
+					"should_stop": info.ShouldStop,
+					"reason":      info.StopReason,
+				})
+			}
+			if exitCode {
+				if info.ShouldStop {
+					if !quiet {
+						fmt.Printf("%s stop %s\n", info.ID, info.StopReason)
+					}
+					return nil
+				}
+				if !quiet {
+					fmt.Printf("%s continue\n", info.ID)
+				}
+				return ExitCodeError{Code: 1}
+			}
+			if quiet {
+				if info.ShouldStop {
+					fmt.Println("stop")
+				} else {
+					fmt.Println("continue")
+				}
+				return nil
+			}
+			if info.ShouldStop {
+				fmt.Printf("%s stop %s\n", info.ID, info.StopReason)
+				return nil
+			}
+			fmt.Printf("%s continue\n", info.ID)
+			return nil
+		},
+	}
+	returnCmd.Flags().BoolVar(&quiet, "quiet", false, "print only stop/continue")
+	returnCmd.Flags().BoolVar(&exitCode, "exit-code", false, "exit 0 when stop is requested, 1 when work may continue")
+	return returnCmd
+}
+
+func newAgentCheckpointCmd(opts *rootOptions) *cobra.Command {
+	var message string
+	cmd := &cobra.Command{
+		Use:   "checkpoint <id>",
+		Short: "Agent-friendly alias for snapshot",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			svc, err := app.NewService(opts.Repo)
+			if err != nil {
+				return err
+			}
+			result, err := svc.Snapshot(args[0], message)
+			if err != nil {
+				return err
+			}
+			if opts.JSON {
+				return printJSON(result)
+			}
+			if !result.Created {
+				fmt.Printf("%s no changes\n", result.ID)
+				return nil
+			}
+			fmt.Printf("%s %s\n", result.Snapshot.Name, result.Commit)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&message, "msg", "", "snapshot message")
+	return cmd
+}
+
+func newConfigCmd(opts *rootOptions) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "config",
+		Short: "Config and policy inspection",
+	}
+	cmd.AddCommand(&cobra.Command{
+		Use:   "show",
+		Short: "Show the effective AgentGit config for this repo",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			svc, err := app.NewService(opts.Repo)
+			if err != nil {
+				return err
+			}
+			cfg := svc.EffectiveConfig()
+			if opts.JSON {
+				return printJSON(cfg)
+			}
+			fmt.Printf("clean_threshold_hours=%.1f\n", cfg.CleanThresholdHours)
+			fmt.Printf("dashboard_refresh_seconds=%d\n", cfg.DashboardRefreshSecs)
+			fmt.Printf("default_owner=%s\n", cfg.DefaultOwner)
+			fmt.Printf("done_author_name=%s\n", cfg.DoneAuthorName)
+			fmt.Printf("done_author_email=%s\n", cfg.DoneAuthorEmail)
+			fmt.Printf("done_message_template=%s\n", cfg.DoneMessageTemplate)
+			fmt.Printf("snapshot_message_template=%s\n", cfg.SnapshotMessageFormat)
+			fmt.Printf("default_stop_reason=%s\n", cfg.DefaultStopReason)
+			return nil
+		},
+	})
 	return cmd
 }
 

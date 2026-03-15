@@ -7,6 +7,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 type refreshMsg struct{}
@@ -27,18 +28,37 @@ const (
 	focusFiles     dashFocus = "files"
 )
 
+var (
+	dashBorder      = lipgloss.NewStyle().Border(lipgloss.NormalBorder()).BorderForeground(lipgloss.Color("8"))
+	dashPanel       = dashBorder.Padding(0, 1)
+	dashPanelFocus  = dashBorder.BorderForeground(lipgloss.Color("12")).Padding(0, 1)
+	dashHeader      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
+	dashMuted       = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	dashAccent      = lipgloss.NewStyle().Foreground(lipgloss.Color("12")).Bold(true)
+	dashWarn        = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
+	dashStop        = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
+	dashSelected    = lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(lipgloss.Color("10")).Bold(true)
+	dashHelp        = dashBorder.Padding(0, 1).Foreground(lipgloss.Color("7"))
+	dashHeaderPanel = dashBorder.Padding(0, 1).Bold(true).Foreground(lipgloss.Color("15"))
+)
+
+const dashDefaultRefreshSeconds = 2
+
 type dashModel struct {
 	svc           *app.Service
 	mode          dashMode
 	focus         dashFocus
 	entries       []app.AgentSummary
 	selected      int
+	preview       *app.AgentStatus
 	detail        *app.AgentStatus
 	snapshotIndex int
 	fileIndex     int
 	fileBody      string
 	fileTitle     string
 	statusLine    string
+	width         int
+	height        int
 	err           error
 }
 
@@ -48,22 +68,31 @@ func runDashboard(svc *app.Service) error {
 		return err
 	}
 	model := dashModel{
-		svc:     svc,
-		mode:    modeList,
-		focus:   focusSnapshots,
-		entries: entries,
+		svc:        svc,
+		mode:       modeList,
+		focus:      focusSnapshots,
+		entries:    entries,
+		width:      120,
+		height:     36,
+		statusLine: "[j/k] move  [enter] detail  [r] refresh  [q] quit",
 	}
-	model.statusLine = "[j/k] move  [enter] detail  [r] refresh  [q] quit"
+	if len(entries) > 0 {
+		_ = model.loadPreview(entries[0].ID)
+	}
 	_, err = tea.NewProgram(model, tea.WithAltScreen()).Run()
 	return err
 }
 
 func (m dashModel) Init() tea.Cmd {
-	return tickDashboard()
+	return tickDashboard(m.svc.Config.DashboardRefreshSecs)
 }
 
 func (m dashModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		return m, nil
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c":
@@ -84,31 +113,22 @@ func (m dashModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case refreshMsg:
 		next, _ := m.refresh()
-		return next, tickDashboard()
+		return next, tickDashboard(m.svc.Config.DashboardRefreshSecs)
 	}
 	return m, nil
 }
 
 func (m dashModel) View() string {
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("repo: %s\n\n", m.svc.RepoName()))
-	if m.err != nil {
-		b.WriteString("error: " + m.err.Error() + "\n\n")
-	}
-
 	switch m.mode {
 	case modeList:
-		b.WriteString(m.renderList())
+		return m.renderListScreen()
 	case modeDetail:
-		b.WriteString(m.renderDetail())
+		return m.renderDetailScreen()
 	case modeDiff, modeContent:
-		b.WriteString(m.renderFileView())
+		return m.renderFileScreen()
+	default:
+		return "unknown mode"
 	}
-
-	if m.statusLine != "" {
-		b.WriteString("\n" + m.statusLine + "\n")
-	}
-	return b.String()
 }
 
 func (m dashModel) updateList(key string) (tea.Model, tea.Cmd) {
@@ -116,10 +136,12 @@ func (m dashModel) updateList(key string) (tea.Model, tea.Cmd) {
 	case "j", "down":
 		if m.selected < len(m.entries)-1 {
 			m.selected++
+			_ = m.loadSelectedPreview()
 		}
 	case "k", "up":
 		if m.selected > 0 {
 			m.selected--
+			_ = m.loadSelectedPreview()
 		}
 	case "enter":
 		if len(m.entries) == 0 {
@@ -127,7 +149,6 @@ func (m dashModel) updateList(key string) (tea.Model, tea.Cmd) {
 		}
 		if err := m.loadDetail(m.entries[m.selected].ID); err != nil {
 			m.err = err
-			return m, nil
 		}
 	}
 	return m, nil
@@ -194,20 +215,26 @@ func (m dashModel) refresh() (dashModel, tea.Cmd) {
 	}
 	if len(m.entries) == 0 {
 		m.selected = 0
+		m.preview = nil
 	}
 
-	if m.mode == modeDetail && m.detail != nil {
-		if err := m.loadDetail(m.detail.Summary.ID); err != nil {
+	switch m.mode {
+	case modeList:
+		if err := m.loadSelectedPreview(); err != nil {
 			m.err = err
-			m.mode = modeList
-			m.detail = nil
-			m.statusLine = "[j/k] move  [enter] detail  [r] refresh  [q] quit"
+		}
+		m.statusLine = "[j/k] move  [enter] detail  [r] refresh  [q] quit"
+	case modeDetail:
+		if m.detail != nil {
+			if err := m.loadDetail(m.detail.Summary.ID); err != nil {
+				m.err = err
+				m.mode = modeList
+				m.detail = nil
+				m.statusLine = "[j/k] move  [enter] detail  [r] refresh  [q] quit"
+			}
 		}
 	}
-	if m.mode == modeList {
-		m.statusLine = "[j/k] move  [enter] detail  [r] refresh  [q] quit"
-	}
-	return m, tickDashboard()
+	return m, tickDashboard(m.svc.Config.DashboardRefreshSecs)
 }
 
 func (m dashModel) goBack() (tea.Model, tea.Cmd) {
@@ -217,7 +244,7 @@ func (m dashModel) goBack() (tea.Model, tea.Cmd) {
 		m.fileBody = ""
 		m.fileTitle = ""
 		if m.detail != nil {
-			m.statusLine = fmt.Sprintf("detail: %s  [tab] focus  [d] diff  [f] file  [esc] back", m.detail.Summary.ID)
+			m.statusLine = fmt.Sprintf("detail: %s  [tab] switch pane  [d] diff  [f] file  [esc] back", m.detail.Summary.ID)
 		}
 	case modeDetail:
 		m.mode = modeList
@@ -228,6 +255,23 @@ func (m dashModel) goBack() (tea.Model, tea.Cmd) {
 		m.statusLine = "[j/k] move  [enter] detail  [r] refresh  [q] quit"
 	}
 	return m, nil
+}
+
+func (m *dashModel) loadSelectedPreview() error {
+	if len(m.entries) == 0 {
+		m.preview = nil
+		return nil
+	}
+	return m.loadPreview(m.entries[m.selected].ID)
+}
+
+func (m *dashModel) loadPreview(id string) error {
+	status, err := m.svc.Status(id)
+	if err != nil {
+		return err
+	}
+	m.preview = status
+	return nil
 }
 
 func (m *dashModel) loadDetail(id string) error {
@@ -244,7 +288,7 @@ func (m *dashModel) loadDetail(id string) error {
 	if m.fileIndex >= len(m.currentChanges()) {
 		m.fileIndex = 0
 	}
-	m.statusLine = fmt.Sprintf("detail: %s  [tab] focus  [d] diff  [f] file  [esc] back", id)
+	m.statusLine = fmt.Sprintf("detail: %s  [tab] switch pane  [d] diff  [f] file  [esc] back", id)
 	return nil
 }
 
@@ -287,145 +331,246 @@ func (m *dashModel) openFileView(mode dashMode) error {
 	return nil
 }
 
-func (m dashModel) renderList() string {
-	var b strings.Builder
-	if len(m.entries) == 0 {
-		b.WriteString("no agent worktrees\n\n")
-		b.WriteString("[q] quit  [r] refresh\n")
-		return b.String()
-	}
+func (m dashModel) renderListScreen() string {
+	header := m.renderHeader("overview")
+	stats := m.renderStatsBar()
 
-	writeSection := func(title, status string) {
-		b.WriteString(title + "\n")
-		count := 0
-		for i, entry := range m.entries {
-			if entry.Status != status {
-				continue
-			}
-			count++
-			cursor := " "
-			if i == m.selected {
-				cursor = ">"
-			}
-			owner := entry.Owner
-			if owner == "" {
-				owner = "-"
-			}
-			activity := entry.LastActivity
-			if activity == "" {
-				activity = "-"
-			}
-			b.WriteString(fmt.Sprintf("%s %-14s %-10s snaps=%-3d +%d -%d %s\n",
-				cursor,
-				entry.ID,
-				owner,
-				entry.Snapshots,
-				entry.DiffStat.Insertions,
-				entry.DiffStat.Deletions,
-				activity,
-			))
-		}
-		if count == 0 {
-			b.WriteString("  (none)\n")
-		}
-		b.WriteString("\n")
-	}
+	leftWidth := max(36, m.width/2-2)
+	rightWidth := max(38, m.width-leftWidth-3)
+	bodyHeight := max(12, m.height-8)
 
-	writeSection("ACTIVE", "active")
-	writeSection("STOPPED", "stopped")
-	writeSection("ORPHANED", "orphaned")
-	b.WriteString("[j/k] move  [enter] detail  [r] refresh  [q] quit\n")
-	return b.String()
+	left := dashPanelFocus.Width(leftWidth).Height(bodyHeight).Render(m.renderWorktreeList(leftWidth - 4))
+	right := dashPanel.Width(rightWidth).Height(bodyHeight).Render(m.renderPreview(rightWidth-4, bodyHeight-2))
+	body := lipgloss.JoinHorizontal(lipgloss.Top, left, right)
+
+	footer := dashHelp.Width(max(20, m.width-2)).Render(m.statusLine)
+	return lipgloss.JoinVertical(lipgloss.Left, header, stats, body, footer)
 }
 
-func (m dashModel) renderDetail() string {
-	var b strings.Builder
-	if m.detail == nil {
-		return "no detail loaded\n"
-	}
+func (m dashModel) renderDetailScreen() string {
+	header := m.renderHeader("detail")
+	stats := dashHeaderPanel.Width(max(20, m.width-2)).Render(m.renderDetailHeader())
 
-	summary := m.detail.Summary
-	b.WriteString(fmt.Sprintf("%s  %s  snaps=%d  locked=%t\n", summary.ID, summary.Status, summary.Snapshots, m.detail.Locked))
-	if summary.Owner != "" {
-		b.WriteString(fmt.Sprintf("owner: %s\n", summary.Owner))
-	}
-	if summary.Purpose != "" {
-		b.WriteString(fmt.Sprintf("purpose: %s\n", summary.Purpose))
-	}
-	b.WriteString(fmt.Sprintf("path: %s\n", summary.Path))
-	b.WriteString(fmt.Sprintf("branch: %s\n\n", summary.Branch))
-	if len(m.detail.CurrentChanges) > 0 {
-		b.WriteString("Current Changes\n")
-		for _, change := range m.detail.CurrentChanges {
-			b.WriteString(fmt.Sprintf("  %-4s %s\n", change.Status, change.Path))
-		}
-		b.WriteString("\n")
-	}
+	leftWidth := max(28, m.width/4)
+	centerWidth := max(28, m.width/4)
+	rightWidth := max(36, m.width-leftWidth-centerWidth-4)
+	bodyHeight := max(12, m.height-8)
 
-	b.WriteString(m.renderSnapshotPanel())
-	b.WriteString("\n")
-	b.WriteString(m.renderFilePanel())
-	return b.String()
-}
-
-func (m dashModel) renderSnapshotPanel() string {
-	var b strings.Builder
-	label := "Snapshots"
+	leftPanel := dashPanel
+	centerPanel := dashPanel
 	if m.focus == focusSnapshots {
-		label += " [focus]"
+		leftPanel = dashPanelFocus
 	}
-	b.WriteString(label + "\n")
+	if m.focus == focusFiles {
+		centerPanel = dashPanelFocus
+	}
+
+	left := leftPanel.Width(leftWidth).Height(bodyHeight).Render(m.renderSnapshotsPane(leftWidth-4, bodyHeight-2))
+	center := centerPanel.Width(centerWidth).Height(bodyHeight).Render(m.renderFilesPane(centerWidth-4, bodyHeight-2))
+	right := dashPanel.Width(rightWidth).Height(bodyHeight).Render(m.renderInspectorPane(rightWidth-4, bodyHeight-2))
+
+	body := lipgloss.JoinHorizontal(lipgloss.Top, left, center, right)
+	footer := dashHelp.Width(max(20, m.width-2)).Render(m.statusLine)
+	return lipgloss.JoinVertical(lipgloss.Left, header, stats, body, footer)
+}
+
+func (m dashModel) renderFileScreen() string {
+	title := "file"
+	if m.mode == modeDiff {
+		title = "diff"
+	}
+	header := m.renderHeader(title)
+	info := dashHeaderPanel.Width(max(20, m.width-2)).Render(m.fileTitle)
+	bodyHeight := max(12, m.height-6)
+	content := dashPanel.Width(max(20, m.width-2)).Height(bodyHeight).Render(fitText(m.fileBody, max(16, m.width-6), bodyHeight-2))
+	footer := dashHelp.Width(max(20, m.width-2)).Render(m.statusLine)
+	return lipgloss.JoinVertical(lipgloss.Left, header, info, content, footer)
+}
+
+func (m dashModel) renderHeader(section string) string {
+	title := dashHeader.Render("AgentGit Dashboard")
+	repo := dashMuted.Render("repo: " + m.svc.RepoName())
+	mode := dashAccent.Render("view: " + section)
+	summary := dashMuted.Render(fmt.Sprintf("agents: %d", len(m.entries)))
+	if m.err != nil {
+		mode = dashStop.Render("error: " + m.err.Error())
+	}
+	return dashHeaderPanel.Width(max(20, m.width-2)).Render(lipgloss.JoinHorizontal(lipgloss.Top, title, "   ", repo, "   ", mode, "   ", summary))
+}
+
+func (m dashModel) renderStatsBar() string {
+	active := 0
+	stopped := 0
+	orphaned := 0
+	for _, entry := range m.entries {
+		switch entry.Status {
+		case "active":
+			active++
+		case "stopped":
+			stopped++
+		case "orphaned":
+			orphaned++
+		}
+	}
+	cardWidth := max(18, (m.width-4)/3)
+	activeCard := dashPanelFocus.Width(cardWidth).Render("ACTIVE\n" + dashAccent.Render(fmt.Sprintf("%d agents", active)))
+	stoppedCard := dashPanel.Width(cardWidth).Render("STOPPED\n" + dashWarn.Render(fmt.Sprintf("%d agents", stopped)))
+	orphanedCard := dashPanel.Width(cardWidth).Render("ORPHANED\n" + dashStop.Render(fmt.Sprintf("%d agents", orphaned)))
+	return lipgloss.JoinHorizontal(lipgloss.Top, activeCard, stoppedCard, orphanedCard)
+}
+
+func (m dashModel) renderWorktreeList(width int) string {
+	var lines []string
+	lines = append(lines, dashHeader.Render(fmt.Sprintf("Worktrees (%d)", len(m.entries))))
+	lines = append(lines, "")
+	if len(m.entries) == 0 {
+		lines = append(lines, dashMuted.Render("(none)"))
+		return strings.Join(lines, "\n")
+	}
+	for i, entry := range m.entries {
+		cursor := " "
+		rowStyle := lipgloss.NewStyle()
+		if i == m.selected {
+			cursor = ">"
+			rowStyle = dashSelected
+		}
+		status := statusBadge(entry.Status)
+		owner := coalesce(entry.Owner, "-")
+		line := fmt.Sprintf("%s %-12s %-10s snaps=%-2d %s", cursor, entry.ID, owner, entry.Snapshots, status)
+		lines = append(lines, rowStyle.Render(truncateLine(line, width)))
+		lines = append(lines, dashMuted.Render(truncateLine(fmt.Sprintf("  +%d -%d  %s", entry.DiffStat.Insertions, entry.DiffStat.Deletions, coalesce(entry.Purpose, "-")), width)))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m dashModel) renderPreview(width, height int) string {
+	lines := []string{dashHeader.Render("Preview"), ""}
+	if m.preview == nil {
+		lines = append(lines, dashMuted.Render("Select an agent to inspect."))
+		return fitLines(lines, width, height)
+	}
+
+	summary := m.preview.Summary
+	lines = append(lines,
+		fmt.Sprintf("id: %s", summary.ID),
+		fmt.Sprintf("status: %s", summary.Status),
+		fmt.Sprintf("owner: %s", coalesce(summary.Owner, "-")),
+		fmt.Sprintf("branch: %s", summary.Branch),
+		fmt.Sprintf("path: %s", summary.Path),
+		"",
+		dashHeader.Render("Current"),
+	)
+	if len(m.preview.CurrentChanges) == 0 {
+		lines = append(lines, dashMuted.Render("  clean relative to latest snapshot/base"))
+	} else {
+		for _, change := range m.preview.CurrentChanges {
+			lines = append(lines, fmt.Sprintf("  %-4s %s", change.Status, change.Path))
+		}
+	}
+
+	lines = append(lines, "", dashHeader.Render("Snapshots"))
+	if len(m.preview.Snapshots) == 0 {
+		lines = append(lines, dashMuted.Render("  none"))
+	} else {
+		for _, snapshot := range m.preview.Snapshots {
+			lines = append(lines, fmt.Sprintf("  %-8s %s", snapshot.Name, truncateLine(snapshot.Message, max(12, width-14))))
+		}
+	}
+	if m.preview.Stop != nil {
+		lines = append(lines, "", dashHeader.Render("Stop"), fmt.Sprintf("  %s", coalesce(m.preview.Stop.Reason, "-")))
+	}
+	return fitLines(lines, width, height)
+}
+
+func (m dashModel) renderDetailHeader() string {
+	if m.detail == nil {
+		return "No detail loaded"
+	}
+	s := m.detail.Summary
+	return fmt.Sprintf("%s  %s  snaps=%d  current=%d  locked=%t",
+		s.ID, statusBadge(s.Status), s.Snapshots, len(m.detail.CurrentChanges), m.detail.Locked)
+}
+
+func (m dashModel) renderSnapshotsPane(width, height int) string {
+	snapshotCount := 0
+	if m.detail != nil {
+		snapshotCount = len(m.detail.Snapshots)
+	}
+	lines := []string{dashHeader.Render(fmt.Sprintf("Snapshots (%d)", snapshotCount))}
+	if m.focus == focusSnapshots {
+		lines[0] += " " + dashAccent.Render("[focus]")
+	}
+	lines = append(lines, "")
 	if m.detail == nil || len(m.detail.Snapshots) == 0 {
-		b.WriteString("  (none)\n")
-		return b.String()
+		lines = append(lines, dashMuted.Render("(none)"))
+		return fitLines(lines, width, height)
 	}
 	for i, snapshot := range m.detail.Snapshots {
-		cursor := " "
+		prefix := " "
+		style := lipgloss.NewStyle()
 		if i == m.snapshotIndex {
-			cursor = ">"
+			prefix = ">"
+			style = dashSelected
 		}
-		b.WriteString(fmt.Sprintf("%s %-8s %s %s\n", cursor, snapshot.Name, snapshot.Timestamp, snapshot.Commit))
+		lines = append(lines, style.Render(truncateLine(fmt.Sprintf("%s %-8s %s", prefix, snapshot.Name, formatTimestamp(snapshot.Timestamp)), width)))
+		lines = append(lines, dashMuted.Render(truncateLine(fmt.Sprintf("  %s", snapshot.Commit), width)))
 	}
-	return b.String()
+	return fitLines(lines, width, height)
 }
 
-func (m dashModel) renderFilePanel() string {
-	var b strings.Builder
-	label := "Files"
+func (m dashModel) renderFilesPane(width, height int) string {
+	lines := []string{dashHeader.Render(fmt.Sprintf("Files (%d)", len(m.currentChanges())))}
 	if m.focus == focusFiles {
-		label += " [focus]"
+		lines[0] += " " + dashAccent.Render("[focus]")
 	}
-	b.WriteString(label + "\n")
+	lines = append(lines, "")
 	changes := m.currentChanges()
 	if len(changes) == 0 {
-		b.WriteString("  (none)\n")
-		return b.String()
+		lines = append(lines, dashMuted.Render("(none)"))
+		return fitLines(lines, width, height)
 	}
 	for i, change := range changes {
-		cursor := " "
+		prefix := " "
+		style := lipgloss.NewStyle()
 		if i == m.fileIndex {
-			cursor = ">"
+			prefix = ">"
+			style = dashSelected
 		}
-		b.WriteString(fmt.Sprintf("%s %-4s %s\n", cursor, change.Status, change.Path))
+		lines = append(lines, style.Render(truncateLine(fmt.Sprintf("%s %-4s %s", prefix, change.Status, change.Path), width)))
 	}
-	return b.String()
+	return fitLines(lines, width, height)
 }
 
-func (m dashModel) renderFileView() string {
-	var b strings.Builder
-	title := "file view"
-	if m.mode == modeDiff {
-		title = "diff view"
+func (m dashModel) renderInspectorPane(width, height int) string {
+	lines := []string{dashHeader.Render("Inspector"), ""}
+	if m.detail == nil {
+		lines = append(lines, dashMuted.Render("No detail loaded"))
+		return fitLines(lines, width, height)
 	}
-	b.WriteString(title + "\n")
-	b.WriteString(m.fileTitle + "\n")
-	b.WriteString(strings.Repeat("-", max(20, len(m.fileTitle))) + "\n")
-	if strings.TrimSpace(m.fileBody) == "" {
-		b.WriteString("(empty)\n")
-	} else {
-		b.WriteString(m.fileBody + "\n")
+
+	snapshot := m.currentSnapshot()
+	if snapshot != nil {
+		lines = append(lines,
+			fmt.Sprintf("snapshot: %s", snapshot.Name),
+			fmt.Sprintf("commit: %s", snapshot.Commit),
+			fmt.Sprintf("parent: %s", coalesce(snapshot.Parent, "-")),
+			fmt.Sprintf("time: %s", formatTimestamp(snapshot.Timestamp)),
+			"",
+			dashHeader.Render("Message"),
+			snapshot.Message,
+		)
 	}
-	return b.String()
+	if len(m.detail.CurrentChanges) > 0 {
+		lines = append(lines, "", dashHeader.Render("Unsnapshotted"))
+		for _, change := range m.detail.CurrentChanges {
+			lines = append(lines, fmt.Sprintf("  %-4s %s", change.Status, change.Path))
+		}
+	}
+	if m.detail.Stop != nil {
+		lines = append(lines, "", dashHeader.Render("Stop"))
+		lines = append(lines, m.detail.Stop.Reason)
+	}
+	return fitLines(lines, width, height)
 }
 
 func (m dashModel) currentSnapshot() *app.SnapshotInfo {
@@ -446,8 +591,64 @@ func (m dashModel) currentChanges() []app.FileChange {
 	return snapshot.Changes
 }
 
-func tickDashboard() tea.Cmd {
-	return tea.Tick(2*time.Second, func(time.Time) tea.Msg {
+func tickDashboard(seconds int) tea.Cmd {
+	if seconds <= 0 {
+		seconds = dashDefaultRefreshSeconds
+	}
+	return tea.Tick(time.Duration(seconds)*time.Second, func(time.Time) tea.Msg {
 		return refreshMsg{}
 	})
+}
+
+func statusBadge(status string) string {
+	switch status {
+	case "active":
+		return dashAccent.Render("active")
+	case "stopped":
+		return dashWarn.Render("stopped")
+	case "orphaned":
+		return dashStop.Render("orphaned")
+	default:
+		return dashMuted.Render(status)
+	}
+}
+
+func fitText(body string, width, height int) string {
+	lines := strings.Split(strings.ReplaceAll(body, "\r\n", "\n"), "\n")
+	return fitLines(lines, width, height)
+}
+
+func fitLines(lines []string, width, height int) string {
+	if height <= 0 {
+		height = len(lines)
+	}
+	out := make([]string, 0, min(len(lines), height))
+	for i, line := range lines {
+		if i >= height {
+			break
+		}
+		out = append(out, truncateLine(line, width))
+	}
+	return strings.Join(out, "\n")
+}
+
+func truncateLine(line string, width int) string {
+	if width <= 0 {
+		return line
+	}
+	runes := []rune(line)
+	if len(runes) <= width {
+		return line
+	}
+	if width <= 3 {
+		return string(runes[:width])
+	}
+	return string(runes[:width-3]) + "..."
+}
+
+func coalesce(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
 }

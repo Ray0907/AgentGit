@@ -241,6 +241,107 @@ func TestServiceCreateFailsWhenPreservedBranchExists(t *testing.T) {
 	}
 }
 
+func TestServiceLoadsConfigAndAppliesDefaults(t *testing.T) {
+	repo := initTestRepo(t)
+	runGit(t, repo, "config", "agentgit.defaultOwner", "agent-bot")
+	runGit(t, repo, "config", "agentgit.doneAuthorName", "Agent Bot")
+	runGit(t, repo, "config", "agentgit.doneAuthorEmail", "agent@example.com")
+	runGit(t, repo, "config", "agentgit.doneMessageTemplate", "ship {id}: {purpose}")
+	runGit(t, repo, "config", "agentgit.snapshotMessageTemplate", "snap {id} {timestamp}")
+	runGit(t, repo, "config", "agentgit.cleanHours", "6")
+	runGit(t, repo, "config", "agentgit.dashboardRefreshSeconds", "5")
+	runGit(t, repo, "config", "agentgit.stopReason", "human requested stop")
+
+	svc, err := NewService(repo)
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+
+	if svc.Config.DefaultOwner != "agent-bot" {
+		t.Fatalf("unexpected default owner: %+v", svc.Config)
+	}
+	if svc.Config.DoneAuthorName != "Agent Bot" || svc.Config.DoneAuthorEmail != "agent@example.com" {
+		t.Fatalf("unexpected done author config: %+v", svc.Config)
+	}
+	if svc.Config.CleanThresholdHours != 6 {
+		t.Fatalf("unexpected clean threshold: %+v", svc.Config)
+	}
+	if svc.Config.DashboardRefreshSecs != 5 {
+		t.Fatalf("unexpected dashboard refresh seconds: %+v", svc.Config)
+	}
+
+	summary, err := svc.Create(CreateOptions{ID: "fix-auth", Purpose: "fix auth"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if summary.Owner != "agent-bot" {
+		t.Fatalf("expected default owner to be applied, got %s", summary.Owner)
+	}
+
+	writeFile(t, filepath.Join(summary.Path, "app.txt"), "hello v2\n")
+	snap, err := svc.Snapshot("fix-auth", "")
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if !strings.HasPrefix(snap.Snapshot.Message, "snap fix-auth ") {
+		t.Fatalf("unexpected snapshot message: %s", snap.Snapshot.Message)
+	}
+
+	result, err := svc.Done("fix-auth", DoneOptions{})
+	if err != nil {
+		t.Fatalf("Done: %v", err)
+	}
+	commitMessage := runGitRaw(t, repo, "show", "-s", "--format=%s", result.Commit)
+	if strings.TrimSpace(commitMessage) != "ship fix-auth: fix auth" {
+		t.Fatalf("unexpected final commit message: %q", commitMessage)
+	}
+	authorName := runGit(t, repo, "show", "-s", "--format=%an", result.Commit)
+	if authorName != "Agent Bot" {
+		t.Fatalf("unexpected author name: %s", authorName)
+	}
+	authorEmail := runGit(t, repo, "show", "-s", "--format=%ae", result.Commit)
+	if authorEmail != "agent@example.com" {
+		t.Fatalf("unexpected author email: %s", authorEmail)
+	}
+}
+
+func TestAgentPreflightInfoReflectsStopAndPolicy(t *testing.T) {
+	repo := initTestRepo(t)
+	runGit(t, repo, "config", "agentgit.defaultOwner", "agent-bot")
+	runGit(t, repo, "config", "agentgit.stopReason", "human requested stop")
+
+	svc, err := NewService(repo)
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+
+	summary, err := svc.Create(CreateOptions{ID: "fix-auth", Purpose: "fix auth"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	writeFile(t, filepath.Join(summary.Path, "app.txt"), "hello v2\n")
+	if _, err := svc.Stop("fix-auth", ""); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	info, err := svc.AgentPreflightInfo("fix-auth")
+	if err != nil {
+		t.Fatalf("AgentPreflightInfo: %v", err)
+	}
+	if !info.ShouldStop {
+		t.Fatalf("expected should_stop to be true")
+	}
+	if info.StopReason != "human requested stop" {
+		t.Fatalf("unexpected stop reason: %s", info.StopReason)
+	}
+	if info.DefaultOwner != "agent-bot" {
+		t.Fatalf("unexpected default owner: %s", info.DefaultOwner)
+	}
+	if info.CurrentChanges != 1 {
+		t.Fatalf("expected one current change, got %d", info.CurrentChanges)
+	}
+}
+
 func initTestRepo(t *testing.T) string {
 	t.Helper()
 	repo := t.TempDir()

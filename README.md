@@ -16,6 +16,8 @@ The CLI binary is `agt`.
 - finalize to a clean branch commit with `done`
 - cleanup for abandoned agent state
 - terminal dashboard with list, detail, diff, and file views
+- repo-level config and policy via `git config`
+- agent integration helpers for preflight, stop checks, and checkpoints
 
 ## Build
 
@@ -73,6 +75,14 @@ Open the dashboard:
 agt --repo /path/to/repo dash
 ```
 
+Agent integration helpers:
+
+```bash
+agt --repo /path/to/repo agent preflight fix-auth --json
+agt --repo /path/to/repo agent should-stop fix-auth --exit-code
+agt --repo /path/to/repo agent checkpoint fix-auth
+```
+
 ## Command Summary
 
 - `create`: create a worktree, branch, metadata ref, and base ref
@@ -85,6 +95,10 @@ agt --repo /path/to/repo dash
 - `diff`: diff snapshots or current worktree state
 - `stop`: write a cooperative stop signal and lock the worktree
 - `clean`: remove stale orphaned worktrees and refs
+- `agent preflight`: return agent-facing state and policy information
+- `agent should-stop`: check cooperative stop state
+- `agent checkpoint`: agent-friendly alias for `snapshot`
+- `config show`: show effective repo policy
 - `dash`: open the terminal dashboard
 
 ## Data Model
@@ -97,6 +111,23 @@ AgentGit stores state inside git:
 - `refs/agents/<id>/stop`
 
 Snapshot commits are regular git commit objects linked by parent history. Modified trees are built with an isolated `GIT_INDEX_FILE`, so snapshotting does not mutate the repository index.
+
+Repo policy can be set with git config keys such as:
+
+- `agentgit.cleanHours`
+- `agentgit.dashboardRefreshSeconds`
+- `agentgit.defaultOwner`
+- `agentgit.doneAuthorName`
+- `agentgit.doneAuthorEmail`
+- `agentgit.doneMessageTemplate`
+- `agentgit.snapshotMessageTemplate`
+- `agentgit.stopReason`
+
+For shell scripting, `agt agent should-stop --exit-code` returns:
+
+- `0` when work should stop
+- `1` when work may continue
+- `>1` for actual errors
 
 ## Current Scope
 
