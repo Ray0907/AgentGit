@@ -284,8 +284,8 @@ func (s *Service) Snapshot(id, message string) (*SnapshotResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	if state.Worktree == nil {
-		return nil, fmt.Errorf("agent %q has no active worktree", id)
+	if err := s.requireLiveWorktreeState(state, "snapshot"); err != nil {
+		return nil, err
 	}
 	if err := s.validateSnapshotState(state); err != nil {
 		return nil, err
@@ -347,8 +347,8 @@ func (s *Service) Rollback(id, spec, reason string) (*RollbackResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	if state.Worktree == nil {
-		return nil, fmt.Errorf("agent %q has no active worktree", id)
+	if err := s.requireLiveWorktreeState(state, "rollback"); err != nil {
+		return nil, err
 	}
 
 	target, err := s.resolveSnapshotSpec(id, spec)
@@ -392,6 +392,9 @@ func (s *Service) Stop(id, reason string) (*AgentStatus, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := s.requireLiveWorktreeState(state, "stop"); err != nil {
+		return nil, err
+	}
 
 	stop := StopSignal{
 		Reason:    reason,
@@ -409,13 +412,30 @@ func (s *Service) Stop(id, reason string) (*AgentStatus, error) {
 	return s.Status(id)
 }
 
+func (s *Service) Resume(id string) (*AgentStatus, error) {
+	state, err := s.loadState(id)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.requireLiveWorktreeState(state, "resume"); err != nil {
+		return nil, err
+	}
+	if err := s.deleteRefIfExists(s.stopRef(id)); err != nil {
+		return nil, err
+	}
+	if err := s.unlockWorktree(state.Worktree.Path); err != nil {
+		return nil, err
+	}
+	return s.Status(id)
+}
+
 func (s *Service) Done(id string, opts DoneOptions) (*ActionResult, error) {
 	state, err := s.loadState(id)
 	if err != nil {
 		return nil, err
 	}
-	if state.Worktree == nil {
-		return nil, fmt.Errorf("agent %q has no active worktree", id)
+	if err := s.requireLiveWorktreeState(state, "done"); err != nil {
+		return nil, err
 	}
 	if strings.TrimSpace(state.Base) == "" {
 		return nil, fmt.Errorf("agent %q is missing a base commit", id)
@@ -493,15 +513,16 @@ func (s *Service) Abort(id string) (*ActionResult, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := s.requireLiveWorktreeState(state, "abort"); err != nil {
+		return nil, err
+	}
 
 	branch := state.branchOrDefault(id)
-	if state.Worktree != nil {
-		if err := s.unlockWorktree(state.Worktree.Path); err != nil {
-			return nil, err
-		}
-		if err := s.removeWorktree(state.Worktree.Path); err != nil {
-			return nil, err
-		}
+	if err := s.unlockWorktree(state.Worktree.Path); err != nil {
+		return nil, err
+	}
+	if err := s.removeWorktree(state.Worktree.Path); err != nil {
+		return nil, err
 	}
 	if err := s.deleteBranch(branch); err != nil {
 		return nil, err
@@ -1360,6 +1381,23 @@ func (s *Service) validateSnapshotState(state *agentState) error {
 		return fmt.Errorf("agent %q has an invalid snapshot chain: latest is not descended from base", state.ID)
 	}
 	return nil
+}
+
+func (s *Service) requireLiveWorktreeState(state *agentState, action string) error {
+	if state == nil {
+		return fmt.Errorf("agent state is required")
+	}
+	switch state.status() {
+	case "active", "stopped":
+		if state.Worktree == nil {
+			return fmt.Errorf("agent %q has no active worktree", state.ID)
+		}
+		return nil
+	case "orphaned":
+		return fmt.Errorf("agent %q cannot %s while orphaned; run clean to remove leftover refs", state.ID, action)
+	default:
+		return fmt.Errorf("agent %q cannot %s while %s", state.ID, action, state.status())
+	}
 }
 
 func (s *Service) resolveDiffSide(id, spec string) (string, bool, error) {

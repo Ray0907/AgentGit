@@ -46,6 +46,7 @@ func Execute() error {
 		newCreateCmd(opts),
 		newSnapshotCmd(opts),
 		newRollbackCmd(opts),
+		newResumeCmd(opts),
 		newDoneCmd(opts),
 		newAbortCmd(opts),
 		newListCmd(opts),
@@ -392,6 +393,30 @@ func newStopCmd(opts *rootOptions) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&reason, "reason", "", "stop reason")
+	return cmd
+}
+
+func newResumeCmd(opts *rootOptions) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "resume <id>",
+		Short: "Clear the stop signal and unlock the worktree",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			svc, err := app.NewService(opts.Repo)
+			if err != nil {
+				return err
+			}
+			status, err := svc.Resume(args[0])
+			if err != nil {
+				return err
+			}
+			if opts.JSON {
+				return printJSON(status)
+			}
+			fmt.Printf("%s resumed\n", status.Summary.ID)
+			return nil
+		},
+	}
 	return cmd
 }
 

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -371,6 +372,69 @@ func TestServiceRollbackThenResnapshotRemainsLinear(t *testing.T) {
 	}
 }
 
+func TestServiceResumeClearsStopAndUnlocksWorktree(t *testing.T) {
+	repo := initTestRepo(t)
+	svc, err := NewService(repo)
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+
+	summary, err := svc.Create(CreateOptions{ID: "fix-auth"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	writeFile(t, filepath.Join(summary.Path, "app.txt"), "hello v2\n")
+
+	stopped, err := svc.Stop("fix-auth", "human review")
+	if err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if stopped.Stop == nil || stopped.Stop.Reason != "human review" {
+		t.Fatalf("expected stop signal to be recorded, got %+v", stopped.Stop)
+	}
+	if !stopped.Locked {
+		t.Fatalf("expected worktree to be locked after stop")
+	}
+
+	resumed, err := svc.Resume("fix-auth")
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	if resumed.Stop != nil {
+		t.Fatalf("expected stop signal to be cleared, got %+v", resumed.Stop)
+	}
+	if resumed.Locked {
+		t.Fatalf("expected worktree to be unlocked after resume")
+	}
+	if resumed.Summary.Status != "active" {
+		t.Fatalf("expected active status after resume, got %s", resumed.Summary.Status)
+	}
+}
+
+func TestServiceAbortFailsForOrphanedAgent(t *testing.T) {
+	repo := initTestRepo(t)
+	svc, err := NewService(repo)
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+
+	summary, err := svc.Create(CreateOptions{ID: "fix-auth"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := runGitCommand(repo, "worktree", "remove", "--force", summary.Path); err != nil {
+		t.Fatalf("remove worktree: %v", err)
+	}
+
+	_, err = svc.Abort("fix-auth")
+	if err == nil {
+		t.Fatalf("expected abort to fail for orphaned agent")
+	}
+	if !strings.Contains(err.Error(), "cannot abort while orphaned") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestServiceLoadsConfigAndAppliesDefaults(t *testing.T) {
 	repo := initTestRepo(t)
 	runGit(t, repo, "config", "agentgit.defaultOwner", "agent-bot")
@@ -512,4 +576,13 @@ func runGitRaw(t *testing.T, dir string, args ...string) string {
 		t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, string(out))
 	}
 	return string(out)
+}
+
+func runGitCommand(dir string, args ...string) error {
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("git %s failed: %v\n%s", strings.Join(args, " "), err, string(out))
+	}
+	return nil
 }
