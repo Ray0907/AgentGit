@@ -411,6 +411,44 @@ func TestServiceResumeClearsStopAndUnlocksWorktree(t *testing.T) {
 	}
 }
 
+func TestCheckStopLightweight(t *testing.T) {
+	repo := initTestRepo(t)
+	svc, err := NewService(repo)
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+
+	_, err = svc.Create(CreateOptions{ID: "fix-auth"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Before stop: should not stop
+	check, err := svc.CheckStop("fix-auth")
+	if err != nil {
+		t.Fatalf("CheckStop: %v", err)
+	}
+	if check.ShouldStop {
+		t.Fatalf("expected should_stop=false before stop signal")
+	}
+
+	// After stop: should stop
+	_, err = svc.Stop("fix-auth", "budget exceeded")
+	if err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	check, err = svc.CheckStop("fix-auth")
+	if err != nil {
+		t.Fatalf("CheckStop: %v", err)
+	}
+	if !check.ShouldStop {
+		t.Fatalf("expected should_stop=true after stop signal")
+	}
+	if check.Reason != "budget exceeded" {
+		t.Fatalf("expected reason 'budget exceeded', got %q", check.Reason)
+	}
+}
+
 func TestServiceAbortFailsForOrphanedAgent(t *testing.T) {
 	repo := initTestRepo(t)
 	svc, err := NewService(repo)

@@ -542,42 +542,39 @@ func newAgentShouldStopCmd(opts *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			info, err := svc.AgentPreflightInfo(args[0])
+			// Use lightweight CheckStop instead of full AgentPreflightInfo/Status.
+			check, err := svc.CheckStop(args[0])
 			if err != nil {
 				return err
 			}
 			if opts.JSON {
-				return printJSON(map[string]any{
-					"id":          info.ID,
-					"should_stop": info.ShouldStop,
-					"reason":      info.StopReason,
-				})
+				return printJSON(check)
 			}
 			if exitCode {
-				if info.ShouldStop {
+				if check.ShouldStop {
 					if !quiet {
-						fmt.Printf("%s stop %s\n", info.ID, info.StopReason)
+						fmt.Printf("%s stop %s\n", check.ID, check.Reason)
 					}
 					return nil
 				}
 				if !quiet {
-					fmt.Printf("%s continue\n", info.ID)
+					fmt.Printf("%s continue\n", check.ID)
 				}
 				return ExitCodeError{Code: 1}
 			}
 			if quiet {
-				if info.ShouldStop {
+				if check.ShouldStop {
 					fmt.Println("stop")
 				} else {
 					fmt.Println("continue")
 				}
 				return nil
 			}
-			if info.ShouldStop {
-				fmt.Printf("%s stop %s\n", info.ID, info.StopReason)
+			if check.ShouldStop {
+				fmt.Printf("%s stop %s\n", check.ID, check.Reason)
 				return nil
 			}
-			fmt.Printf("%s continue\n", info.ID)
+			fmt.Printf("%s continue\n", check.ID)
 			return nil
 		},
 	}

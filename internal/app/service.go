@@ -828,40 +828,71 @@ type AgentPreflight struct {
 	CleanHours      float64  `json:"clean_threshold_hours"`
 }
 
+// StopCheck is a lightweight result for checking stop signals without loading full agent state.
+type StopCheck struct {
+	ID         string `json:"id"`
+	ShouldStop bool   `json:"should_stop"`
+	Reason     string `json:"reason,omitempty"`
+}
+
+// CheckStop checks whether a cooperative stop signal exists for the given agent.
+// This is much cheaper than AgentPreflightInfo since it only reads the stop ref (2 git calls max).
+func (s *Service) CheckStop(id string) (*StopCheck, error) {
+	stop, err := s.readStop(id)
+	if err != nil {
+		return nil, err
+	}
+	result := &StopCheck{ID: id}
+	if stop != nil {
+		result.ShouldStop = true
+		result.Reason = stop.Reason
+	}
+	return result, nil
+}
+
 func (s *Service) AgentPreflightInfo(id string) (*AgentPreflight, error) {
-	status, err := s.Status(id)
+	state, err := s.loadState(id)
 	if err != nil {
 		return nil, err
 	}
 
-	currentPaths := make([]string, 0, len(status.CurrentChanges))
-	for _, change := range status.CurrentChanges {
+	// Use snapshotCount instead of fetching the full snapshot list — preflight only needs the count.
+	snapCount, err := s.snapshotCount(state)
+	if err != nil {
+		return nil, err
+	}
+	currentChanges, err := s.currentChanges(state)
+	if err != nil {
+		return nil, err
+	}
+	currentPaths := make([]string, 0, len(currentChanges))
+	for _, change := range currentChanges {
 		currentPaths = append(currentPaths, change.Path)
 	}
 
 	stopReason := ""
 	shouldStop := false
-	if status.Stop != nil {
+	if state.Stop != nil {
 		shouldStop = true
-		stopReason = status.Stop.Reason
+		stopReason = state.Stop.Reason
 	}
 
 	return &AgentPreflight{
 		ID:              id,
-		Path:            status.Summary.Path,
-		Branch:          status.Summary.Branch,
-		Base:            status.Base,
-		Latest:          status.Latest,
-		Locked:          status.Locked,
+		Path:            state.pathOrEmpty(),
+		Branch:          state.branchOrDefault(id),
+		Base:            state.Base,
+		Latest:          state.Latest,
+		Locked:          state.worktreeLocked(),
 		ShouldStop:      shouldStop,
 		StopReason:      stopReason,
-		CurrentChanges:  len(status.CurrentChanges),
+		CurrentChanges:  len(currentChanges),
 		CurrentPaths:    currentPaths,
-		SnapshotCount:   len(status.Snapshots),
-		DoneAuthorName:  firstNonEmpty(s.Config.DoneAuthorName, status.Summary.Owner),
+		SnapshotCount:   snapCount,
+		DoneAuthorName:  firstNonEmpty(s.Config.DoneAuthorName, state.metaOwnerOrDefault()),
 		DoneAuthorEmail: s.Config.DoneAuthorEmail,
-		DoneMessage:     s.defaultDoneMessage(id, statusToMeta(status)),
-		SnapshotMessage: s.renderTemplate(s.Config.SnapshotMessageFormat, id, statusToMeta(status), time.Now().UTC()),
+		DoneMessage:     s.defaultDoneMessage(id, state.Meta),
+		SnapshotMessage: s.renderTemplate(s.Config.SnapshotMessageFormat, id, state.Meta, time.Now().UTC()),
 		DefaultOwner:    s.Config.DefaultOwner,
 		RefreshSeconds:  s.Config.DashboardRefreshSecs,
 		CleanHours:      s.Config.CleanThresholdHours,
@@ -873,35 +904,72 @@ func (s *Service) loadState(id string) (*agentState, error) {
 	if err != nil {
 		return nil, err
 	}
-	meta, err := s.readMeta(id)
+
+	// Batch-read all agent refs in a single git call instead of 4 separate for-each-ref invocations.
+	refs, err := s.readAgentRefs(id)
 	if err != nil {
 		return nil, err
 	}
-	base, _, err := s.readRef(s.baseRef(id))
-	if err != nil {
-		return nil, err
+
+	var meta *AgentMeta
+	if sha := refs[s.metaRef(id)]; sha != "" {
+		out, err := s.git("", nil, "", "cat-file", "-p", sha)
+		if err != nil {
+			return nil, err
+		}
+		var m AgentMeta
+		if err := json.Unmarshal([]byte(out), &m); err != nil {
+			return nil, err
+		}
+		meta = &m
 	}
-	latest, _, err := s.readRef(s.latestRef(id))
-	if err != nil {
-		return nil, err
-	}
-	stop, err := s.readStop(id)
-	if err != nil {
-		return nil, err
+
+	var stop *StopSignal
+	if sha := refs[s.stopRef(id)]; sha != "" {
+		out, err := s.git("", nil, "", "cat-file", "-p", sha)
+		if err != nil {
+			return nil, err
+		}
+		var st StopSignal
+		if err := json.Unmarshal([]byte(out), &st); err != nil {
+			return nil, err
+		}
+		stop = &st
 	}
 
 	state := &agentState{
 		ID:       id,
 		Worktree: worktrees[id],
 		Meta:     meta,
-		Base:     base,
-		Latest:   latest,
+		Base:     refs[s.baseRef(id)],
+		Latest:   refs[s.latestRef(id)],
 		Stop:     stop,
 	}
 	if state.Worktree == nil && state.Meta == nil && state.Base == "" && state.Latest == "" && state.Stop == nil {
 		return nil, fmt.Errorf("agent %q not found", id)
 	}
 	return state, nil
+}
+
+// readAgentRefs reads all refs under refs/agents/<id>/ in a single git call.
+func (s *Service) readAgentRefs(id string) (map[string]string, error) {
+	prefix := "refs/agents/" + id + "/"
+	out, err := s.git("", nil, "", "for-each-ref", "--format=%(refname)%00%(objectname)", prefix)
+	if err != nil {
+		return nil, err
+	}
+	refs := make(map[string]string)
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\x00", 2)
+		if len(parts) == 2 {
+			refs[parts[0]] = parts[1]
+		}
+	}
+	return refs, nil
 }
 
 func (s *Service) agentIDs() (map[string]struct{}, error) {
