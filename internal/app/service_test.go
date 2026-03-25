@@ -32,6 +32,48 @@ func TestNormalizePathForContent(t *testing.T) {
 	}
 }
 
+func TestParseLogSnapshots(t *testing.T) {
+	// Simulates output of: git log --first-parent --format="%x01%H%x00%P%x00%cI%x00%s" --name-status
+	out := "\x01abc123\x00parent1\x00" + "2025-03-01T10:00:00Z" + "\x00snapshot 2\n" +
+		"M\tapp.txt\n" +
+		"A\tnew.txt\n" +
+		"\n" +
+		"\x01def456\x00base000\x00" + "2025-03-01T09:00:00Z" + "\x00snapshot 1\n" +
+		"A\tapp.txt"
+
+	snaps := parseLogSnapshots(out)
+	if len(snaps) != 2 {
+		t.Fatalf("expected 2 snapshots, got %d", len(snaps))
+	}
+	// Newest first (snap-2), oldest last (snap-1).
+	if snaps[0].Name != "snap-2" || snaps[0].Commit != "abc123" {
+		t.Fatalf("unexpected first snapshot: %+v", snaps[0])
+	}
+	if snaps[0].Parent != "parent1" {
+		t.Fatalf("unexpected parent: %q", snaps[0].Parent)
+	}
+	if len(snaps[0].Changes) != 2 {
+		t.Fatalf("expected 2 changes in snap-2, got %d", len(snaps[0].Changes))
+	}
+	if snaps[1].Name != "snap-1" || snaps[1].Commit != "def456" {
+		t.Fatalf("unexpected second snapshot: %+v", snaps[1])
+	}
+	if len(snaps[1].Changes) != 1 {
+		t.Fatalf("expected 1 change in snap-1, got %d", len(snaps[1].Changes))
+	}
+}
+
+func TestParseLogSnapshotsEmpty(t *testing.T) {
+	snaps := parseLogSnapshots("")
+	if snaps != nil {
+		t.Fatalf("expected nil for empty input, got %v", snaps)
+	}
+	snaps = parseLogSnapshots("  \n  ")
+	if snaps != nil {
+		t.Fatalf("expected nil for whitespace input, got %v", snaps)
+	}
+}
+
 func TestParsePorcelainChanges(t *testing.T) {
 	out := " M app.txt\nA  new.txt\nR  old.txt -> renamed.txt\n?? tmp.log\n"
 	changes := parsePorcelainChanges(out)

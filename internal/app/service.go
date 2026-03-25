@@ -141,12 +141,13 @@ type WorktreeInfo struct {
 }
 
 type agentState struct {
-	ID       string
-	Worktree *WorktreeInfo
-	Meta     *AgentMeta
-	Base     string
-	Latest   string
-	Stop     *StopSignal
+	ID        string
+	Worktree  *WorktreeInfo
+	Meta      *AgentMeta
+	Base      string
+	Latest    string
+	Stop      *StopSignal
+	validated bool // true after validateSnapshotState succeeds; avoids repeated merge-base calls
 }
 
 func NewService(path string) (*Service, error) {
@@ -330,15 +331,27 @@ func (s *Service) Snapshot(id, message string) (*SnapshotResult, error) {
 		return nil, err
 	}
 
-	snapshot, err := s.snapshotInfo(commitID, "")
+	// Build SnapshotInfo from data already in memory to avoid re-querying git.
+	diffOut, err := s.git("", nil, "", "diff-tree", "--no-commit-id", "--name-status", "-r", commitID)
 	if err != nil {
 		return nil, err
 	}
-	count, err := s.snapshotCount(&agentState{Base: state.Base, Latest: commitID})
+	countOut, err := s.git("", nil, "", "rev-list", "--count", "--first-parent", commitID, "^"+state.Base)
 	if err != nil {
 		return nil, err
 	}
-	snapshot.Name = fmt.Sprintf("snap-%d", count)
+	count, err := strconv.Atoi(strings.TrimSpace(countOut))
+	if err != nil {
+		return nil, err
+	}
+	snapshot := &SnapshotInfo{
+		Name:      fmt.Sprintf("snap-%d", count),
+		Commit:    commitID,
+		Parent:    parent,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Message:   message,
+		Changes:   parseNameStatusChanges(diffOut),
+	}
 	return &SnapshotResult{ID: id, Created: true, Commit: commitID, Snapshot: snapshot}, nil
 }
 
@@ -570,7 +583,10 @@ func (s *Service) Summary(id string) (*AgentSummary, error) {
 	if err != nil {
 		return nil, err
 	}
+	return s.summaryFromState(id, state)
+}
 
+func (s *Service) summaryFromState(id string, state *agentState) (*AgentSummary, error) {
 	snapshots, err := s.snapshotCount(state)
 	if err != nil {
 		return nil, err
@@ -604,7 +620,7 @@ func (s *Service) Status(id string) (*AgentStatus, error) {
 		return nil, err
 	}
 
-	summary, err := s.Summary(id)
+	summary, err := s.summaryFromState(id, state)
 	if err != nil {
 		return nil, err
 	}
@@ -1182,26 +1198,62 @@ func (s *Service) snapshots(state *agentState) ([]SnapshotInfo, error) {
 	if err := s.validateSnapshotState(state); err != nil {
 		return nil, err
 	}
-	out, err := s.git("", nil, "", "rev-list", "--first-parent", state.Latest, "^"+state.Base)
+	// Fetch all snapshot metadata and file changes in a single git log call
+	// instead of 2n+1 separate invocations (rev-list + per-commit show + diff-tree).
+	out, err := s.git("", nil, "", "log", "--first-parent",
+		"--format=%x01%H%x00%P%x00%cI%x00%s", "--name-status",
+		state.Latest, "^"+state.Base)
 	if err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(out) == "" {
-		return nil, nil
-	}
+	return parseLogSnapshots(out), nil
+}
 
-	commits := strings.Split(strings.TrimSpace(out), "\n")
-	snapshots := make([]SnapshotInfo, 0, len(commits))
-	total := len(commits)
-	for i, commit := range commits {
-		name := fmt.Sprintf("snap-%d", total-i)
-		snapshot, err := s.snapshotInfo(commit, name)
-		if err != nil {
-			return nil, err
-		}
-		snapshots = append(snapshots, *snapshot)
+// parseLogSnapshots parses the combined output of git log --format="%x01%H%x00%P%x00%cI%x00%s" --name-status.
+// Each commit record starts with \x01, followed by metadata fields separated by \x00,
+// then name-status lines on subsequent lines.
+func parseLogSnapshots(out string) []SnapshotInfo {
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return nil
 	}
-	return snapshots, nil
+	// Split on the record separator; first element is empty since output starts with \x01.
+	records := strings.Split(out, "\x01")
+	var snapshots []SnapshotInfo
+	for _, rec := range records {
+		rec = strings.TrimSpace(rec)
+		if rec == "" {
+			continue
+		}
+		// First line is the metadata, remaining lines are name-status entries.
+		lines := strings.SplitN(rec, "\n", 2)
+		meta := lines[0]
+		parts := strings.SplitN(meta, "\x00", 4)
+		if len(parts) < 4 {
+			continue
+		}
+		parent := ""
+		if parentParts := strings.Fields(parts[1]); len(parentParts) > 0 {
+			parent = parentParts[0]
+		}
+		var changes []FileChange
+		if len(lines) > 1 {
+			changes = parseNameStatusChanges(strings.TrimSpace(lines[1]))
+		}
+		snapshots = append(snapshots, SnapshotInfo{
+			Commit:    parts[0],
+			Parent:    parent,
+			Timestamp: parts[2],
+			Message:   parts[3],
+			Changes:   changes,
+		})
+	}
+	// git log outputs newest first; assign names: newest = snap-N, oldest = snap-1.
+	total := len(snapshots)
+	for i := range snapshots {
+		snapshots[i].Name = fmt.Sprintf("snap-%d", total-i)
+	}
+	return snapshots
 }
 
 func (s *Service) currentChanges(state *agentState) ([]FileChange, error) {
@@ -1374,12 +1426,16 @@ func (s *Service) validateSnapshotState(state *agentState) error {
 	if state == nil || strings.TrimSpace(state.Latest) == "" {
 		return nil
 	}
+	if state.validated {
+		return nil
+	}
 	if strings.TrimSpace(state.Base) == "" {
 		return fmt.Errorf("agent %q is missing a base commit", state.ID)
 	}
 	if _, err := s.git("", nil, "", "merge-base", "--is-ancestor", state.Base, state.Latest); err != nil {
 		return fmt.Errorf("agent %q has an invalid snapshot chain: latest is not descended from base", state.ID)
 	}
+	state.validated = true
 	return nil
 }
 
