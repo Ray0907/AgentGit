@@ -66,6 +66,10 @@ Config values resolve in order: environment variable > git config (`agentgit.*`)
 - Agent subcommands (`agent preflight`, `agent should-stop`, `agent checkpoint`, `agent finish`) are integration helpers for automated agents
 - `should-stop --exit-code` returns exit 0 = stop, exit 1 = continue (inverted from typical convention)
 
+## Agent Integration
+
+See `AGENT_GUIDE.md` for the agent-facing protocol, system prompt template, and JSON output reference.
+
 ## Dependencies
 
 - `github.com/spf13/cobra` for CLI command tree

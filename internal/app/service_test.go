@@ -1,6 +1,10 @@
 package app
 
-import "testing"
+import (
+	"fmt"
+	"strings"
+	"testing"
+)
 
 func TestParseDiffStat(t *testing.T) {
 	stat := parseDiffStat(" 3 files changed, 22 insertions(+), 5 deletions(-)")
@@ -88,5 +92,49 @@ func TestParsePorcelainChanges(t *testing.T) {
 	}
 	if changes[3].Status != "??" {
 		t.Fatalf("unexpected untracked status: %+v", changes[3])
+	}
+}
+
+func TestParseBatchCatFile(t *testing.T) {
+	// Simulates output of git cat-file --batch with two objects
+	sha1 := "aaaa"
+	sha2 := "bbbb"
+	content1 := `{"id":"test","purpose":"fix"}`
+	content2 := `{"reason":"stop"}`
+	out := fmt.Sprintf("%s blob %d\n%s\n%s blob %d\n%s\n",
+		sha1, len(content1), content1,
+		sha2, len(content2), content2)
+
+	result := parseBatchCatFile(out, []string{sha1, sha2})
+	if len(result) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(result))
+	}
+	if result[sha1] != content1 {
+		t.Fatalf("sha1 content mismatch: got %q", result[sha1])
+	}
+	if result[sha2] != content2 {
+		t.Fatalf("sha2 content mismatch: got %q", result[sha2])
+	}
+}
+
+func TestParseBatchCatFileSingle(t *testing.T) {
+	sha := "cccc"
+	content := `{"key":"value"}`
+	out := fmt.Sprintf("%s blob %d\n%s\n", sha, len(content), content)
+
+	result := parseBatchCatFile(out, []string{sha})
+	if result[sha] != content {
+		t.Fatalf("content mismatch: got %q", result[sha])
+	}
+}
+
+func TestParseMergeTreeConflicts(t *testing.T) {
+	out := "abc123\nCONFLICT (content): Merge conflict in src/auth.go\nCONFLICT (content): Merge conflict in src/util.go\n"
+	conflicts := parseMergeTreeConflicts(out)
+	if len(conflicts) != 2 {
+		t.Fatalf("expected 2 conflicts, got %d", len(conflicts))
+	}
+	if !strings.Contains(conflicts[0], "auth.go") {
+		t.Fatalf("expected auth.go in first conflict: %s", conflicts[0])
 	}
 }

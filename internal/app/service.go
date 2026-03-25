@@ -825,7 +825,69 @@ type AgentPreflight struct {
 	SnapshotMessage string   `json:"snapshot_message_preview,omitempty"`
 	DefaultOwner    string   `json:"default_owner,omitempty"`
 	RefreshSeconds  int      `json:"refresh_seconds"`
-	CleanHours      float64  `json:"clean_threshold_hours"`
+	CleanHours      float64       `json:"clean_threshold_hours"`
+	MergePreview    *MergePreview `json:"merge_preview,omitempty"`
+}
+
+// MergePreview is the result of a non-destructive merge conflict check using git merge-tree.
+type MergePreview struct {
+	Clean     bool     `json:"clean"`
+	Conflicts []string `json:"conflicts,omitempty"`
+}
+
+// PreviewMerge checks if the agent's current work will merge cleanly with the base branch HEAD.
+// Uses git merge-tree which is completely non-destructive (no worktree or index changes).
+func (s *Service) PreviewMerge(id string) (*MergePreview, error) {
+	state, err := s.loadState(id)
+	if err != nil {
+		return nil, err
+	}
+	if state.Base == "" {
+		return nil, fmt.Errorf("agent %q has no base commit", id)
+	}
+
+	// Determine what to merge: latest snapshot or current worktree tree
+	mergeHead := state.Latest
+	if mergeHead == "" {
+		mergeHead = state.Base
+	}
+
+	// Get current HEAD of the base branch to check for divergence
+	branchHead, err := s.git("", nil, "", "rev-parse", state.branchOrDefault(id))
+	if err != nil {
+		// Branch may not exist yet; use base directly
+		branchHead = state.Base
+	}
+
+	// git merge-tree --write-tree returns exit 0 if clean, exit 1 if conflicts
+	out, err := s.git("", nil, "", "merge-tree", "--write-tree", "--name-only", state.Base, branchHead, mergeHead)
+	if err != nil {
+		// Exit 1 with output means conflicts
+		errMsg := err.Error()
+		if strings.Contains(errMsg, "CONFLICT") || strings.Contains(out, "CONFLICT") {
+			conflicts := parseMergeTreeConflicts(errMsg)
+			return &MergePreview{Clean: false, Conflicts: conflicts}, nil
+		}
+		// Parse conflicts from the output if present
+		conflicts := parseMergeTreeConflicts(out)
+		if len(conflicts) > 0 {
+			return &MergePreview{Clean: false, Conflicts: conflicts}, nil
+		}
+		return nil, err
+	}
+
+	return &MergePreview{Clean: true}, nil
+}
+
+func parseMergeTreeConflicts(out string) []string {
+	var conflicts []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "CONFLICT") {
+			conflicts = append(conflicts, line)
+		}
+	}
+	return conflicts
 }
 
 // StopCheck is a lightweight result for checking stop signals without loading full agent state.
@@ -911,30 +973,44 @@ func (s *Service) loadState(id string) (*agentState, error) {
 		return nil, err
 	}
 
+	// Batch-read JSON blobs (meta, stop) in a single cat-file call when possible.
+	metaSha := refs[s.metaRef(id)]
+	stopSha := refs[s.stopRef(id)]
+
 	var meta *AgentMeta
-	if sha := refs[s.metaRef(id)]; sha != "" {
-		out, err := s.git("", nil, "", "cat-file", "-p", sha)
-		if err != nil {
-			return nil, err
-		}
-		var m AgentMeta
-		if err := json.Unmarshal([]byte(out), &m); err != nil {
-			return nil, err
-		}
-		meta = &m
+	var stop *StopSignal
+
+	blobShas := make([]string, 0, 2)
+	if metaSha != "" {
+		blobShas = append(blobShas, metaSha)
+	}
+	if stopSha != "" {
+		blobShas = append(blobShas, stopSha)
 	}
 
-	var stop *StopSignal
-	if sha := refs[s.stopRef(id)]; sha != "" {
-		out, err := s.git("", nil, "", "cat-file", "-p", sha)
+	if len(blobShas) > 0 {
+		blobs, err := s.batchCatFile(blobShas)
 		if err != nil {
 			return nil, err
 		}
-		var st StopSignal
-		if err := json.Unmarshal([]byte(out), &st); err != nil {
-			return nil, err
+		if metaSha != "" {
+			if content, ok := blobs[metaSha]; ok {
+				var m AgentMeta
+				if err := json.Unmarshal([]byte(content), &m); err != nil {
+					return nil, err
+				}
+				meta = &m
+			}
 		}
-		stop = &st
+		if stopSha != "" {
+			if content, ok := blobs[stopSha]; ok {
+				var st StopSignal
+				if err := json.Unmarshal([]byte(content), &st); err != nil {
+					return nil, err
+				}
+				stop = &st
+			}
+		}
 	}
 
 	state := &agentState{
@@ -970,6 +1046,60 @@ func (s *Service) readAgentRefs(id string) (map[string]string, error) {
 		}
 	}
 	return refs, nil
+}
+
+// batchCatFile reads multiple git objects in a single cat-file --batch call.
+// Returns a map from SHA to object content.
+func (s *Service) batchCatFile(shas []string) (map[string]string, error) {
+	if len(shas) == 0 {
+		return nil, nil
+	}
+	if len(shas) == 1 {
+		out, err := s.git("", nil, "", "cat-file", "-p", shas[0])
+		if err != nil {
+			return nil, err
+		}
+		return map[string]string{shas[0]: out}, nil
+	}
+	stdin := strings.Join(shas, "\n") + "\n"
+	out, err := s.git("", nil, stdin, "cat-file", "--batch")
+	if err != nil {
+		return nil, err
+	}
+	return parseBatchCatFile(out, shas), nil
+}
+
+// parseBatchCatFile parses output from git cat-file --batch.
+// Each object is formatted as: "<sha> <type> <size>\n<content>\n"
+func parseBatchCatFile(out string, shas []string) map[string]string {
+	result := make(map[string]string, len(shas))
+	remaining := out
+	for _, sha := range shas {
+		// Find the header line: "<sha> <type> <size>"
+		headerEnd := strings.Index(remaining, "\n")
+		if headerEnd < 0 {
+			break
+		}
+		header := remaining[:headerEnd]
+		remaining = remaining[headerEnd+1:]
+
+		parts := strings.Fields(header)
+		if len(parts) < 3 || parts[0] != sha {
+			continue
+		}
+		size, err := strconv.Atoi(parts[2])
+		if err != nil || size < 0 || size > len(remaining) {
+			continue
+		}
+		result[sha] = remaining[:size]
+		// Skip content + trailing newline
+		if size+1 <= len(remaining) {
+			remaining = remaining[size+1:]
+		} else {
+			remaining = ""
+		}
+	}
+	return result
 }
 
 func (s *Service) agentIDs() (map[string]struct{}, error) {

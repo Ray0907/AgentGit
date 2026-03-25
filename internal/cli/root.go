@@ -503,7 +503,8 @@ func newAgentCmd(opts *rootOptions) *cobra.Command {
 }
 
 func newAgentPreflightCmd(opts *rootOptions) *cobra.Command {
-	return &cobra.Command{
+	var checkMerge bool
+	cmd := &cobra.Command{
 		Use:   "preflight <id>",
 		Short: "Return agent-facing status, policy, and stop information",
 		Args:  cobra.ExactArgs(1),
@@ -516,6 +517,12 @@ func newAgentPreflightCmd(opts *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if checkMerge {
+				preview, mergeErr := svc.PreviewMerge(args[0])
+				if mergeErr == nil {
+					info.MergePreview = preview
+				}
+			}
 			if opts.JSON {
 				return printJSON(info)
 			}
@@ -525,9 +532,14 @@ func newAgentPreflightCmd(opts *rootOptions) *cobra.Command {
 				fmt.Printf("stop_reason=%s\n", info.StopReason)
 			}
 			fmt.Printf("path=%s\nbranch=%s\n", info.Path, info.Branch)
+			if info.MergePreview != nil {
+				fmt.Printf("merge_clean=%t\n", info.MergePreview.Clean)
+			}
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&checkMerge, "check-merge", false, "preview merge conflicts with base branch")
+	return cmd
 }
 
 func newAgentShouldStopCmd(opts *rootOptions) *cobra.Command {
