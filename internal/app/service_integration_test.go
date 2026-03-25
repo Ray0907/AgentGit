@@ -600,6 +600,7 @@ func initTestRepo(t *testing.T) string {
 	runGit(t, repo, "init")
 	runGit(t, repo, "config", "user.name", "Test User")
 	runGit(t, repo, "config", "user.email", "test@example.com")
+	runGit(t, repo, "config", "commit.gpgsign", "false")
 	writeFile(t, filepath.Join(repo, "app.txt"), "hello v1\n")
 	runGit(t, repo, "add", "app.txt")
 	runGit(t, repo, "commit", "-m", "initial commit")
