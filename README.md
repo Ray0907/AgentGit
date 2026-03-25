@@ -24,6 +24,7 @@ Use it in local or test repositories first. Do not make it the primary workflow 
 - terminal dashboard with list, detail, diff, and file views
 - repo-level config and policy via `git config`
 - agent integration helpers for preflight, stop checks, and checkpoints
+- **[Agent Integration Guide](./AGENT_GUIDE.md)** for embedding AgentGit into AI agent system prompts
 
 ## Build
 

@@ -503,7 +503,8 @@ func newAgentCmd(opts *rootOptions) *cobra.Command {
 }
 
 func newAgentPreflightCmd(opts *rootOptions) *cobra.Command {
-	return &cobra.Command{
+	var checkMerge bool
+	cmd := &cobra.Command{
 		Use:   "preflight <id>",
 		Short: "Return agent-facing status, policy, and stop information",
 		Args:  cobra.ExactArgs(1),
@@ -516,6 +517,12 @@ func newAgentPreflightCmd(opts *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if checkMerge {
+				preview, mergeErr := svc.PreviewMerge(args[0])
+				if mergeErr == nil {
+					info.MergePreview = preview
+				}
+			}
 			if opts.JSON {
 				return printJSON(info)
 			}
@@ -525,9 +532,14 @@ func newAgentPreflightCmd(opts *rootOptions) *cobra.Command {
 				fmt.Printf("stop_reason=%s\n", info.StopReason)
 			}
 			fmt.Printf("path=%s\nbranch=%s\n", info.Path, info.Branch)
+			if info.MergePreview != nil {
+				fmt.Printf("merge_clean=%t\n", info.MergePreview.Clean)
+			}
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&checkMerge, "check-merge", false, "preview merge conflicts with base branch")
+	return cmd
 }
 
 func newAgentShouldStopCmd(opts *rootOptions) *cobra.Command {
@@ -542,42 +554,39 @@ func newAgentShouldStopCmd(opts *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			info, err := svc.AgentPreflightInfo(args[0])
+			// Use lightweight CheckStop instead of full AgentPreflightInfo/Status.
+			check, err := svc.CheckStop(args[0])
 			if err != nil {
 				return err
 			}
 			if opts.JSON {
-				return printJSON(map[string]any{
-					"id":          info.ID,
-					"should_stop": info.ShouldStop,
-					"reason":      info.StopReason,
-				})
+				return printJSON(check)
 			}
 			if exitCode {
-				if info.ShouldStop {
+				if check.ShouldStop {
 					if !quiet {
-						fmt.Printf("%s stop %s\n", info.ID, info.StopReason)
+						fmt.Printf("%s stop %s\n", check.ID, check.Reason)
 					}
 					return nil
 				}
 				if !quiet {
-					fmt.Printf("%s continue\n", info.ID)
+					fmt.Printf("%s continue\n", check.ID)
 				}
 				return ExitCodeError{Code: 1}
 			}
 			if quiet {
-				if info.ShouldStop {
+				if check.ShouldStop {
 					fmt.Println("stop")
 				} else {
 					fmt.Println("continue")
 				}
 				return nil
 			}
-			if info.ShouldStop {
-				fmt.Printf("%s stop %s\n", info.ID, info.StopReason)
+			if check.ShouldStop {
+				fmt.Printf("%s stop %s\n", check.ID, check.Reason)
 				return nil
 			}
-			fmt.Printf("%s continue\n", info.ID)
+			fmt.Printf("%s continue\n", check.ID)
 			return nil
 		},
 	}
